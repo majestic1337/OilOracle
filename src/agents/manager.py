@@ -1,7 +1,7 @@
 """Manager agent - orchestrates other agents."""
 
-from src.agents.base import BaseAgent
 from src.agents.analyst import AnalystAgent
+from src.agents.base import BaseAgent
 from src.agents.risk import RiskAgent
 from src.agents.trader import TraderAgent
 
