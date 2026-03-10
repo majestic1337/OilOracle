@@ -1,0 +1,3 @@
+news-dataset:
+  id: "Brianferrell787/financial-news-multisource"
+  output_dir: "data/raw"

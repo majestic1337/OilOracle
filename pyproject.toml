@@ -1,0 +1,36 @@
+[project]
+name = "oiloracle"
+version = "0.1.0"
+description = "Trading & ML system with multi-agent architecture"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=4.6.1",
+    "dotenv>=0.9.9",
+    "huggingface-hub>=1.6.0",
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.8",
+    "psycopg2-binary>=2.9.11",
+    "pymongo>=4.16.0",
+    "seaborn>=0.13.2",
+    "sqlalchemy>=2.0.48",
+    "tqdm>=4.67.3",
+    "yfinance>=1.2.0",
+]
+
+[project.scripts]
+bachelor = "src.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
