@@ -9,13 +9,21 @@ dependencies = [
     "dotenv>=0.9.9",
     "huggingface-hub>=1.6.0",
     "ipykernel>=7.2.0",
+    "lxml>=6.0.2",
     "matplotlib>=3.10.8",
+    "pmdarima>=2.1.1",
     "psycopg2-binary>=2.9.11",
     "pymongo>=4.16.0",
+    "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
     "sqlalchemy>=2.0.48",
+    "torch>=2.10.0",
     "tqdm>=4.67.3",
     "yfinance>=1.2.0",
+    "optuna>=3.5.0",
+    "xgboost>=2.0.0",
+    "lightgbm>=4.0.0",
+    "statsmodels>=0.14.0",
 ]
 
 [project.scripts]
