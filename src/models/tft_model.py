@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import numpy as np
@@ -44,7 +45,6 @@ class TFTForecaster(DeepLearningForecasterWrapper):
 
         model_kwargs: dict[str, Any] = {
             "hidden_size": 64,
-            "lstm_layers": 2,
             "n_head": 4,
             "dropout": 0.1,
             "attn_dropout": 0.1,
@@ -54,6 +54,9 @@ class TFTForecaster(DeepLearningForecasterWrapper):
             "early_stop_patience_steps": 10,
             "random_seed": 42,
         }
+        signature = inspect.signature(TFT)
+        if "num_encoder_layers" in signature.parameters:
+            model_kwargs["num_encoder_layers"] = 2
         if loss is not None:
             model_kwargs["loss"] = loss
 
