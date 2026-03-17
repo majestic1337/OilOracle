@@ -1,8 +1,6 @@
 """Risk agent - risk assessment and position sizing."""
 
-<<<<<<< Updated upstream
 from src.agents.base import BaseAgent
-=======
 from __future__ import annotations
 
 import asyncio
@@ -34,7 +32,6 @@ RISK_KEYS = [
     "signal_strength",
     "model_agreement",
 ]
->>>>>>> Stashed changes
 
 
 class RiskAgent(BaseAgent):

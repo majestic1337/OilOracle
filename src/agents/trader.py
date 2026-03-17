@@ -1,8 +1,6 @@
 """Trader agent - order execution and trade management."""
 
-<<<<<<< Updated upstream
 from src.agents.base import BaseAgent
-=======
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +23,6 @@ SYSTEM_PROMPT = (
     "DECISION: SELL  \n"
     "DECISION: HOLD"
 )
->>>>>>> Stashed changes
 
 
 class TraderAgent(BaseAgent):

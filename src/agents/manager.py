@@ -1,11 +1,9 @@
 """Manager agent - orchestrates other agents."""
 
-<<<<<<< Updated upstream
 from src.agents.analyst import AnalystAgent
 from src.agents.base import BaseAgent
 from src.agents.risk import RiskAgent
 from src.agents.trader import TraderAgent
-=======
 from __future__ import annotations
 
 import asyncio
@@ -37,7 +35,6 @@ SYSTEM_PROMPT = (
     "  \"timestamp\": \"<ISO 8601>\"\n"
     "}"
 )
->>>>>>> Stashed changes
 
 
 class ManagerAgent(BaseAgent):
