@@ -1,9 +1,5 @@
 """Multi-agent trading system."""
 
-from src.agents.analyst import AnalystAgent
-from src.agents.base import BaseAgent
-from src.agents.manager import ManagerAgent
-from src.agents.risk import RiskAgent
-from src.agents.trader import TraderAgent
+from src.agents.base import BaseAgent, get_llm
 
-__all__ = ["BaseAgent", "AnalystAgent", "ManagerAgent", "RiskAgent", "TraderAgent"]
+__all__ = ["BaseAgent", "get_llm"]
