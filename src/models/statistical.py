@@ -227,7 +227,7 @@ class ARIMAGARCHModel(BaseForecaster):
 
             # Навчаємо GARCH на масштабованих residuals
             garch = arch_model(resids_scaled, vol="Garch", p=1, q=1, dist="normal")
-            garch_fit = garch.fit(disp="off", rescale=False)
+            garch_fit = garch.fit(disp="off")
         except Exception as exc:  # noqa: BLE001 - convergence or fit errors
             self._logger.warning(
                 "ARIMA/GARCH fit failed; fallback to RandomWalk: {error}",
