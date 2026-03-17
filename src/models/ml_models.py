@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from loguru import logger
 
 from src.models.base import BaseForecaster, calculate_metrics
@@ -46,6 +47,8 @@ class XGBoostForecaster(BaseForecaster):
         self.model_q10: Any | None = None
         self.model_q50: Any | None = None
         self.model_q90: Any | None = None
+        self.feature_names_: list[str] | None = None
+        self.feature_names_: list[str] | None = None
 
     def _build_model(self, quantile: float) -> Any:
         try:
@@ -159,6 +162,7 @@ class LightGBMForecaster(BaseForecaster):
     ) -> "LightGBMForecaster":
         """Fit three independent quantile models with optional early stopping."""
         self._logger.info("Fitting LightGBM quantile models (q10/q50/q90)")
+        self.feature_names_ = X_train.columns.tolist() if hasattr(X_train, "columns") else None
         X_arr = _as_2d_array(X_train)
         y_arr = _as_1d_array(y_train)
 
@@ -193,7 +197,13 @@ class LightGBMForecaster(BaseForecaster):
         """Return the median (q50) forecast."""
         if self.model_q50 is None:
             raise ValueError("LightGBMForecaster must be fitted before prediction")
-        return self.model_q50.predict(_as_2d_array(X)).astype(float)
+        X_input: Any = X
+        if not isinstance(X_input, pd.DataFrame):
+            if self.feature_names_ is not None:
+                X_input = pd.DataFrame(X_input, columns=self.feature_names_)
+            else:
+                X_input = _as_2d_array(X_input)
+        return self.model_q50.predict(X_input).astype(float)
 
     def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
         """Return the 10th and 90th percentile forecasts as an interval."""

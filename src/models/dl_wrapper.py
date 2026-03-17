@@ -76,14 +76,25 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         df = pd.DataFrame({"unique_id": "brent", "ds": X.index})
 
-        for col in X.columns:
-            df[col] = X[col].values
-
         if y is not None:
             y_array = _as_1d_array(y)
             if len(y_array) != len(X):
                 raise ValueError("y length must match X length")
             df["y"] = y_array
+
+        try:
+            from src.models.patchtst_model import PatchTSTForecaster
+        except Exception:  # pragma: no cover - avoid hard dependency
+            PatchTSTForecaster = None  # type: ignore[assignment]
+        if PatchTSTForecaster is not None and isinstance(self, PatchTSTForecaster):
+            # PatchTST channel-independent — ігноруємо exogenous
+            keep_cols = ["unique_id", "ds"]
+            if "y" in df.columns:
+                keep_cols.append("y")
+            return df[keep_cols]
+
+        for col in X.columns:
+            df[col] = X[col].values
 
         return df
 
@@ -100,7 +111,7 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         signature = inspect.signature(self.model_class)
         for param in ("futr_exog_list", "hist_exog_list"):
-            if param in signature.parameters and exog_columns:
+            if param in signature.parameters and exog_columns and param not in model_kwargs:
                 model_kwargs[param] = exog_columns
 
         return self.model_class(**model_kwargs)
@@ -164,24 +175,34 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Generate point forecasts aligned with the test window."""
-        forecast_df = self._predict_df(X)
-        pred_columns = [col for col in forecast_df.columns if col not in {"unique_id", "ds"}]
-        if not pred_columns:
-            raise ValueError("No prediction columns returned by NeuralForecast")
+        if self._nf is None:
+            raise ValueError("Model must be fitted before prediction")
 
-        point_col = self._select_point_column(pred_columns)
-        preds = forecast_df[point_col].to_numpy(dtype=float)
+        df_test = self._prepare_df(X)
 
-        if len(preds) != len(X):
-            self._logger.warning(
-                "Prediction length {pred_len} differs from X length {x_len}; aligning",
-                pred_len=len(preds),
+        try:
+            forecast_df = self._nf.predict(futr_df=df_test)
+        except TypeError:
+            forecast_df = self._nf.predict(df=df_test)
+
+        if not isinstance(forecast_df, pd.DataFrame):
+            raise ValueError("NeuralForecast predict must return a DataFrame")
+
+        # neuralforecast може повернути більше рядків ніж треба
+        # Фільтруємо тільки дати з X_test
+        test_dates = X.index
+        model_col = forecast_df.columns[-1]
+
+        forecast_df = forecast_df[forecast_df["ds"].isin(test_dates)]
+        forecast_df = forecast_df.set_index("ds").reindex(test_dates)
+
+        result = forecast_df[model_col].to_numpy(dtype=float)
+
+        if len(result) != len(X):
+            self._logger.error(
+                "predict output length {pred_len} != X length {x_len} after filtering",
+                pred_len=len(result),
                 x_len=len(X),
             )
-            if len(preds) > len(X):
-                preds = preds[: len(X)]
-            else:
-                pad = len(X) - len(preds)
-                preds = np.pad(preds, (0, pad), mode="edge")
 
-        return preds
+        return result

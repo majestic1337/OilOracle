@@ -159,6 +159,7 @@ class ARIMAGARCHModel(BaseForecaster):
         self.random_state = random_state
         self.arima_model: Any | None = None
         self.garch_model: Any | None = None
+        self.garch_scale_: float = 1.0
         self._fit_success = False
         self._fallback = RandomWalkModel()
         self._logger = logger.bind(model=self.__class__.__name__)
@@ -220,8 +221,13 @@ class ARIMAGARCHModel(BaseForecaster):
                 self._fit_success = False
                 return self
 
-            garch = arch_model(residuals, vol="GARCH", p=1, q=1, dist="normal")
-            garch_fit = garch.fit(disp="off")
+            # Масштабуємо residuals для стабільної GARCH оптимізації
+            GARCH_SCALE = 100.0
+            resids_scaled = residuals * GARCH_SCALE
+
+            # Навчаємо GARCH на масштабованих residuals
+            garch = arch_model(resids_scaled, vol="Garch", p=1, q=1, dist="normal")
+            garch_fit = garch.fit(disp="off", rescale=False)
         except Exception as exc:  # noqa: BLE001 - convergence or fit errors
             self._logger.warning(
                 "ARIMA/GARCH fit failed; fallback to RandomWalk: {error}",
@@ -232,6 +238,7 @@ class ARIMAGARCHModel(BaseForecaster):
 
         self.arima_model = arima_model
         self.garch_model = garch_fit
+        self.garch_scale_ = GARCH_SCALE
         self._fit_success = True
         return self
 
@@ -290,7 +297,8 @@ class ARIMAGARCHModel(BaseForecaster):
             return self._fallback.predict_interval(X, alpha=alpha)
 
         z = 1.96
-        std = np.sqrt(variance)
+        garch_scale = self.garch_scale_ if self.garch_scale_ else 1.0
+        std = np.sqrt(variance) / garch_scale
         lower = mean - z * std
         upper = mean + z * std
         return lower.astype(float), upper.astype(float)
