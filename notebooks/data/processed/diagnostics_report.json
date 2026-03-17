@@ -1,0 +1,42 @@
+{
+  "brent_return": {
+    "adf_pvalue": 8.917753280085415e-17,
+    "kpss_pvalue": 0.1,
+    "ljungbox_arch": {
+      "lag_10": 9.287456915092805e-104,
+      "lag_20": 3.3927321039974444e-194
+    },
+    "is_stationary": true,
+    "kpss_interpolation_warning": "The test statistic is outside of the range of p-values available in the\nlook-up table. The actual p-value is greater than the p-value returned.\n"
+  },
+  "wti_return": {
+    "adf_pvalue": 4.7825368350730835e-24,
+    "kpss_pvalue": 0.1,
+    "ljungbox_arch": {
+      "lag_10": 5.0219829148055824e-231,
+      "lag_20": 1.2231339408413594e-261
+    },
+    "is_stationary": true,
+    "kpss_interpolation_warning": "The test statistic is outside of the range of p-values available in the\nlook-up table. The actual p-value is greater than the p-value returned.\n"
+  },
+  "dxy_return": {
+    "adf_pvalue": 0.0,
+    "kpss_pvalue": 0.1,
+    "ljungbox_arch": {
+      "lag_10": 5.586572400812086e-129,
+      "lag_20": 1.942567541247908e-269
+    },
+    "is_stationary": true,
+    "kpss_interpolation_warning": "The test statistic is outside of the range of p-values available in the\nlook-up table. The actual p-value is greater than the p-value returned.\n"
+  },
+  "gold_return": {
+    "adf_pvalue": 0.0,
+    "kpss_pvalue": 0.1,
+    "ljungbox_arch": {
+      "lag_10": 5.946787923301109e-89,
+      "lag_20": 7.576299830496423e-126
+    },
+    "is_stationary": true,
+    "kpss_interpolation_warning": "The test statistic is outside of the range of p-values available in the\nlook-up table. The actual p-value is greater than the p-value returned.\n"
+  }
+}
