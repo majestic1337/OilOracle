@@ -56,9 +56,11 @@ class NBEATSForecaster(DeepLearningForecasterWrapper):
             n_blocks=n_blocks,
             mlp_units=mlp_units,
             dropout_prob_theta=0.1,
-            max_steps=1000,
+            max_steps=300,
             learning_rate=1e-3,
             val_check_steps=50,
             early_stop_patience_steps=10,
             random_seed=42,
+            accelerator="cpu",
+            devices=1,
         )

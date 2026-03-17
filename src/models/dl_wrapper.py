@@ -50,12 +50,12 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self.input_size = input_size
         self.model_kwargs = kwargs
         self._logger = logger.bind(model=self.__class__.__name__)
-        self._accelerator = _detect_accelerator()
+        self._accelerator = "cpu"
         self._exog_columns: list[str] = []
         self._nf: Any | None = None
         self._model: Any | None = None
 
-        self._logger.info("Using accelerator: {acc}", acc=self._accelerator)
+        self._logger.info("Using CPU for DL training (GPU disabled)")
 
     def _prepare_df(self, X: pd.DataFrame, y: Any | None = None) -> pd.DataFrame:
         """Convert feature matrices into NeuralForecast dataframe format.
@@ -136,7 +136,12 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             raise ImportError("neuralforecast is required for deep learning models") from exc
 
         self._model = self._build_model(self._exog_columns)
-        self._nf = NeuralForecast(models=[self._model], freq="B")
+        self.model_instance = self._model
+        self._nf = NeuralForecast(
+            models=[self.model_instance],
+            freq="B",
+            local_scaler_type=None,
+        )
 
         if X_val is not None and y_val is not None:
             val_size = len(y_val)

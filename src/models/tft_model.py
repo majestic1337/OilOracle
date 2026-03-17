@@ -48,11 +48,13 @@ class TFTForecaster(DeepLearningForecasterWrapper):
             "n_head": 4,
             "dropout": 0.1,
             "attn_dropout": 0.1,
-            "max_steps": 1000,
+            "max_steps": 300,
             "learning_rate": 1e-3,
             "val_check_steps": 50,
             "early_stop_patience_steps": 10,
             "random_seed": 42,
+            "accelerator": "cpu",
+            "devices": 1,
         }
         signature = inspect.signature(TFT)
         if "num_encoder_layers" in signature.parameters:
