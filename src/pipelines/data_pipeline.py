@@ -113,16 +113,31 @@ def compute_log_returns(df: pd.DataFrame) -> pd.DataFrame:
 
     Returns:
         DataFrame of log returns with *_return suffixes.
+
+    Note:
+        WTI квітень 2020 містить від'ємні futures ціни (артефакт ринкової
+        аномалії). Замінюються через ffill(limit=1). Ця дата має бути
+        згадана в тезисі як data quality exception.
     """
     df = df.sort_index()
-    non_positive = (df <= 0).sum()
-    total_non_positive = int(non_positive.sum())
-    if total_non_positive > 0:
-        logger.warning(
-            "Detected non-positive prices before log returns: {counts}",
-            counts=non_positive.to_dict(),
-        )
-        df = df.mask(df <= 0, np.nan).dropna()
+    # Логуємо які саме дати мають проблемні значення
+    for col in df.columns:
+        bad_dates = df.index[df[col] <= 0].tolist()
+        if bad_dates:
+            logger.warning(
+                f"{col}: non-positive prices on {bad_dates} "
+                f"— replacing with NaN before log-returns"
+            )
+
+    # Замінюємо non-positive на NaN
+    df = df.where(df > 0, other=np.nan)
+
+    # Forward fill максимум 1 день (сусідня ціна як proxy)
+    # КРИТИЧНО: тільки ffill(limit=1), не більше
+    df = df.ffill(limit=1)
+
+    # Якщо після ffill залишились NaN — дропаємо рядок
+    df = df.dropna()
     # Returns across weekends/holidays will naturally accumulate due to the shift.
     returns = np.log(df / df.shift(1))
     returns = returns.iloc[1:]

@@ -33,14 +33,11 @@ class WFVConfig:
     top_k_shap: int = 15
     random_state: int = 42
 
-<<<<<<< HEAD
     @property
     def model_kwargs(self) -> dict:
         """Словник що передається в конструктор будь-якої DL моделі."""
         return {"horizon": self.horizon}
 
-=======
->>>>>>> origin/main
 
 @dataclass(slots=True)
 class WFVIteration:
