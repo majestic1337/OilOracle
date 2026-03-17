@@ -11,7 +11,11 @@ from fastapi import APIRouter
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+<<<<<<< HEAD
+from src.pipelines.config import PipelineConfig
+=======
 from src.pipeline.config import PipelineConfig
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

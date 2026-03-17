@@ -8,7 +8,7 @@ from typing import Any, Dict, List, TYPE_CHECKING
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agents.base import get_llm
-from src.pipeline.config import PipelineConfig
+from src.pipelines.config import PipelineConfig
 
 if TYPE_CHECKING:  # pragma: no cover
     from src.agents.graph import AgentState

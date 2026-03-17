@@ -1,14 +1,9 @@
-"""Base agent helpers and shared utilities."""
+"""Base agent class."""
 
-from __future__ import annotations
-
-import os
 from abc import ABC, abstractmethod
 
-from langchain_core.language_models import BaseChatModel
-
 from src.core.logger import get_logger
-from src.pipeline.config import PipelineConfig
+from src.pipelines.config import PipelineConfig
 
 
 def get_llm(cfg: PipelineConfig) -> BaseChatModel:
@@ -58,7 +53,7 @@ def get_llm(cfg: PipelineConfig) -> BaseChatModel:
 
 
 class BaseAgent(ABC):
-    """Abstract base class for legacy agent patterns."""
+    """Abstract base class for all agents."""
 
     def __init__(self, name: str):
         self.name = name
@@ -67,4 +62,4 @@ class BaseAgent(ABC):
     @abstractmethod
     def run(self, *args, **kwargs):
         """Execute agent logic. Must be implemented by subclasses."""
-        raise NotImplementedError
+        pass

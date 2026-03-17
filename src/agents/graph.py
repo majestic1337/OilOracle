@@ -13,7 +13,7 @@ from src.agents.bullish import bullish_agent
 from src.agents.manager import manager_agent
 from src.agents.risk import risk_agent
 from src.agents.trader import trader_agent
-from src.pipeline.config import PipelineConfig
+from src.pipelines.config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
