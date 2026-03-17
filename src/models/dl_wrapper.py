@@ -119,17 +119,6 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self._exog_columns = list(X_train.columns)
         df_train = self._prepare_df(X_train, y_train)
 
-<<<<<<< HEAD
-=======
-        val_size = 0
-        if X_val is not None and y_val is not None:
-            df_val = self._prepare_df(X_val, y_val)
-            df_fit = pd.concat([df_train, df_val]).sort_values("ds")
-            val_size = len(df_val)
-        else:
-            df_fit = df_train
-
->>>>>>> origin/main
         try:
             from neuralforecast import NeuralForecast
         except Exception as exc:  # noqa: BLE001 - optional dependency
@@ -138,7 +127,6 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self._model = self._build_model(self._exog_columns)
         self._nf = NeuralForecast(models=[self._model], freq="B")
 
-<<<<<<< HEAD
         if X_val is not None and y_val is not None:
             val_size = len(y_val)
             self._nf.fit(df_train, val_size=val_size)
@@ -147,12 +135,6 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             for model in self._nf.models:
                 model.early_stop_patience_steps = -1
             self._nf.fit(df_train)
-=======
-        if val_size > 0:
-            self._nf.fit(df_fit, val_size=val_size)
-        else:
-            self._nf.fit(df_fit)
->>>>>>> origin/main
 
         return self
 
