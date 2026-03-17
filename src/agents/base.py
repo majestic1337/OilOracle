@@ -3,8 +3,6 @@
 from abc import ABC, abstractmethod
 
 from src.core.logger import get_logger
-<<<<<<< Updated upstream
-=======
 from src.pipelines.config import PipelineConfig
 
 
@@ -52,7 +50,6 @@ def get_llm(cfg: PipelineConfig) -> BaseChatModel:
             temperature=0.3,
         )
     raise ValueError(f"Unknown llm_provider: {cfg.llm_provider}")
->>>>>>> Stashed changes
 
 
 class BaseAgent(ABC):
