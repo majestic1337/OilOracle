@@ -221,8 +221,12 @@ class ARIMAGARCHModel(BaseForecaster):
                 self._fit_success = False
                 return self
 
-            # Масштабуємо residuals для стабільної GARCH оптимізації
-            GARCH_SCALE = 100.0
+            # Адаптивний scale: цілимось в scale ~100 для GARCH
+            target_scale = 100.0
+            resids_scaled = residuals
+            current_scale = np.std(resids_scaled) if len(resids_scaled) > 0 else 1.0
+            GARCH_SCALE = target_scale / current_scale if current_scale > 0 else 100.0
+
             resids_scaled = residuals * GARCH_SCALE
 
             # Навчаємо GARCH на масштабованих residuals

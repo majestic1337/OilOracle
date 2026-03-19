@@ -179,35 +179,49 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         return columns[0]
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Generate point forecasts aligned with the test window."""
-        if self._nf is None:
-            raise ValueError("Model must be fitted before prediction")
+        # Будуємо futr_df — тільки unique_id та ds, без y
+        # Це "майбутні" точки для яких потрібен прогноз
+        futr_df = pd.DataFrame(
+            {
+                "unique_id": "brent",
+                "ds": pd.DatetimeIndex(X.index),
+            }
+        )
 
-        df_test = self._prepare_df(X)
+        # Додаємо exogenous features якщо модель їх підтримує
+        # PatchTST — не додаємо (channel-independent)
+        from src.models.patchtst_model import PatchTSTForecaster
+
+        if not isinstance(self, PatchTSTForecaster):
+            for col in X.columns:
+                futr_df[col] = X[col].values
 
         try:
-            forecast_df = self._nf.predict(futr_df=df_test)
-        except TypeError:
-            forecast_df = self._nf.predict(df=df_test)
+            forecast_df = self._nf.predict(futr_df=futr_df)
+        except Exception:
+            # Якщо futr_df не приймається — predict без аргументів
+            forecast_df = self._nf.predict()
 
-        if not isinstance(forecast_df, pd.DataFrame):
-            raise ValueError("NeuralForecast predict must return a DataFrame")
+        exclude = {"unique_id", "ds"}
+        model_cols = [col for col in forecast_df.columns if col not in exclude]
 
-        # neuralforecast може повернути більше рядків ніж треба
-        # Фільтруємо тільки дати з X_test
-        test_dates = X.index
-        model_col = forecast_df.columns[-1]
+        if not model_cols:
+            raise ValueError("No forecast columns in neuralforecast output")
 
-        forecast_df = forecast_df[forecast_df["ds"].isin(test_dates)]
-        forecast_df = forecast_df.set_index("ds").reindex(test_dates)
+        # Для quantile моделей (TFT) беремо медіану q50
+        median_col = next(
+            (col for col in model_cols if "50" in col or "median" in col.lower()),
+            model_cols[0],
+        )
 
-        result = forecast_df[model_col].to_numpy(dtype=float)
+        # Фільтруємо та реіндексуємо на дати X_test
+        forecast_df = forecast_df.set_index("ds")
+        result = forecast_df.reindex(X.index)[median_col].values
 
-        if len(result) != len(X):
-            self._logger.error(
-                "predict output length {pred_len} != X length {x_len} after filtering",
-                pred_len=len(result),
-                x_len=len(X),
+        if np.isnan(result).any():
+            self._logger.warning(
+                "NaN in predictions after reindex: {count} values",
+                count=int(np.isnan(result).sum()),
             )
 
         return result

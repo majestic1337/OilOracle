@@ -6,6 +6,7 @@ import inspect
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from loguru import logger
 from neuralforecast.losses.pytorch import MQLoss
 
@@ -117,31 +118,35 @@ class TFTForecaster(DeepLearningForecasterWrapper):
         if alpha != 0.1:
             logger.warning("TFT uses fixed quantiles; ignoring alpha override")
 
-        forecast_df = self._predict_df(X)
-        pred_columns = [col for col in forecast_df.columns if col not in {"unique_id", "ds"}]
-        if not pred_columns:
-            raise ValueError("No prediction columns returned by NeuralForecast")
+        if self._nf is None:
+            raise ValueError("Model must be fitted before prediction")
 
-        q10_col = self._find_quantile_column(pred_columns, 0.1)
-        q90_col = self._find_quantile_column(pred_columns, 0.9)
+        futr_df = pd.DataFrame(
+            {
+                "unique_id": "brent",
+                "ds": pd.DatetimeIndex(X.index),
+            }
+        )
+        for col in X.columns:
+            futr_df[col] = X[col].values
+
+        try:
+            forecast_df = self._nf.predict(futr_df=futr_df)
+        except Exception:
+            forecast_df = self._nf.predict()
+
+        exclude = {"unique_id", "ds"}
+        model_cols = [col for col in forecast_df.columns if col not in exclude]
+        if not model_cols:
+            raise ValueError("No forecast columns in neuralforecast output")
+
+        q10_col = next((col for col in model_cols if "10" in col), None)
+        q90_col = next((col for col in model_cols if "90" in col), None)
         if q10_col is None or q90_col is None:
             raise ValueError("Quantile outputs not found for TFT; ensure QuantileLoss is enabled")
 
-        lower = forecast_df[q10_col].to_numpy(dtype=float)
-        upper = forecast_df[q90_col].to_numpy(dtype=float)
-
-        if len(lower) != len(X):
-            logger.warning(
-                "Interval length {pred_len} differs from X length {x_len}; aligning",
-                pred_len=len(lower),
-                x_len=len(X),
-            )
-            if len(lower) > len(X):
-                lower = lower[: len(X)]
-                upper = upper[: len(X)]
-            else:
-                pad = len(X) - len(lower)
-                lower = np.pad(lower, (0, pad), mode="edge")
-                upper = np.pad(upper, (0, pad), mode="edge")
+        forecast_df = forecast_df.set_index("ds")
+        lower = forecast_df.reindex(X.index)[q10_col].to_numpy(dtype=float)
+        upper = forecast_df.reindex(X.index)[q90_col].to_numpy(dtype=float)
 
         return lower, upper
