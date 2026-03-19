@@ -17,7 +17,7 @@ class PatchTSTForecaster(DeepLearningForecasterWrapper):
     without overwhelming attention costs.
     """
 
-    def __init__(self, horizon: int, input_size: int | None = None) -> None:
+    def __init__(self, horizon: int, input_size: int = None) -> None:
         if input_size is None:
             input_size = max(4 * horizon, 64)
 
@@ -44,5 +44,8 @@ class PatchTSTForecaster(DeepLearningForecasterWrapper):
             model_class=PatchTST,
             horizon=horizon,
             input_size=input_size,
-            **params,
         )
+
+        # Перевизначаємо model_instance після super().__init__
+        # бо super може його перезаписати
+        self.model_instance = PatchTST(**params)
