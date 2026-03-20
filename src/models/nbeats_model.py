@@ -19,48 +19,47 @@ class NBEATSForecaster(DeepLearningForecasterWrapper):
     tuning needed.
     """
 
-    def __init__(self, horizon: int, input_size: int | None = None) -> None:
+    def __init__(self, horizon: int, input_size: int = None) -> None:
         if input_size is None:
-            input_size = 5 * horizon
+            input_size = 5 * horizon if horizon > 1 else 10
 
         try:
             from neuralforecast.models import NBEATS
         except Exception as exc:  # noqa: BLE001 - optional dependency
             raise ImportError("neuralforecast is required for NBEATSForecaster") from exc
 
-        logger.info("Initializing NBEATS forecaster with horizon {h}", h=horizon)
-
         if horizon == 1:
-            # На h=1 trend/seasonality декомпозиція безглузда —
-            # використовуємо identity стек (чистий AR baseline)
-            logger.warning("h=1 detected: using identity stack for N-BEATS")
             stack_types = ["identity"]
             n_blocks = [3]
             mlp_units = [[512, 512]]
+            logger.info("h=1 detected: using identity stack for N-BEATS")
         elif horizon <= 3:
-            # На короткому горизонті тільки trend компонент
             stack_types = ["trend"]
             n_blocks = [3]
             mlp_units = [[512, 512]]
         else:
-            # h=7+ — повна декомпозиція
             stack_types = ["trend", "seasonality"]
             n_blocks = [3, 3]
             mlp_units = [[512, 512], [512, 512]]
 
-        super().__init__(
-            model_class=NBEATS,
-            horizon=horizon,
+        params = dict(
+            h=horizon,
             input_size=input_size,
             stack_types=stack_types,
             n_blocks=n_blocks,
             mlp_units=mlp_units,
-            dropout_prob_theta=0.1,
             max_steps=300,
             learning_rate=1e-3,
             val_check_steps=50,
             early_stop_patience_steps=10,
             random_seed=42,
             accelerator="cpu",
-            devices=1,
         )
+
+        self.model_instance = NBEATS(**params)
+        super().__init__(
+            model_class=NBEATS,
+            horizon=horizon,
+            input_size=input_size,
+        )
+        self.model_instance = NBEATS(**params)

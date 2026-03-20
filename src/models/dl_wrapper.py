@@ -54,47 +54,27 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self._exog_columns: list[str] = []
         self._nf: Any | None = None
         self._model: Any | None = None
+        self.model_instance: Any | None = None
+        self.nf: Any | None = None
+        self._last_train_df: pd.DataFrame | None = None
 
         self._logger.info("Using CPU for DL training (GPU disabled)")
 
-    def _prepare_df(self, X: pd.DataFrame, y: Any | None = None) -> pd.DataFrame:
-        """Convert feature matrices into NeuralForecast dataframe format.
-
-        Args:
-            X: Feature matrix with DatetimeIndex.
-            y: Optional target array/series aligned with X.
-
-        Returns:
-            DataFrame with columns [unique_id, ds, y] plus exogenous features.
-        """
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("X must be a pandas DataFrame with a DatetimeIndex")
-
-        if not isinstance(X.index, pd.DatetimeIndex):
-            X = X.copy()
-            X.index = pd.to_datetime(X.index)
-
-        df = pd.DataFrame({"unique_id": "brent", "ds": X.index})
-
+    def _prepare_df(self, X: pd.DataFrame, y: pd.Series = None) -> pd.DataFrame:
+        df = pd.DataFrame(
+            {
+                "unique_id": "brent",
+                "ds": pd.DatetimeIndex(X.index),
+            }
+        )
         if y is not None:
-            y_array = _as_1d_array(y)
-            if len(y_array) != len(X):
-                raise ValueError("y length must match X length")
-            df["y"] = y_array
+            df["y"] = y.values
 
-        try:
-            from src.models.patchtst_model import PatchTSTForecaster
-        except Exception:  # pragma: no cover - avoid hard dependency
-            PatchTSTForecaster = None  # type: ignore[assignment]
-        if PatchTSTForecaster is not None and isinstance(self, PatchTSTForecaster):
-            # PatchTST channel-independent — ігноруємо exogenous
-            keep_cols = ["unique_id", "ds"]
-            if "y" in df.columns:
-                keep_cols.append("y")
-            return df[keep_cols]
-
-        for col in X.columns:
-            df[col] = X[col].values
+        # PatchTST не підтримує exogenous variables
+        model_name = type(self.model_instance).__name__
+        if model_name != "PatchTST":
+            for col in X.columns:
+                df[col] = X[col].values
 
         return df
 
@@ -142,6 +122,7 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             freq="B",
             local_scaler_type=None,
         )
+        self.nf = self._nf
 
         if X_val is not None and y_val is not None:
             val_size = len(y_val)
@@ -151,6 +132,8 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             for model in self._nf.models:
                 model.early_stop_patience_steps = -1
             self._nf.fit(df_train)
+
+        self._last_train_df = df_train
 
         return self
 
@@ -179,49 +162,40 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         return columns[0]
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        # Будуємо futr_df — тільки unique_id та ds, без y
-        # Це "майбутні" точки для яких потрібен прогноз
-        futr_df = pd.DataFrame(
-            {
-                "unique_id": "brent",
-                "ds": pd.DatetimeIndex(X.index),
-            }
-        )
-
-        # Додаємо exogenous features якщо модель їх підтримує
-        # PatchTST — не додаємо (channel-independent)
-        from src.models.patchtst_model import PatchTSTForecaster
-
-        if not isinstance(self, PatchTSTForecaster):
-            for col in X.columns:
-                futr_df[col] = X[col].values
+        # Використовуємо make_future_dataframe для коректних дат
+        try:
+            futr_df = self.nf.make_future_dataframe(
+                h=self.horizon,
+                data=self._last_train_df,
+            )
+        except Exception:
+            futr_df = pd.DataFrame(
+                {
+                    "unique_id": "brent",
+                    "ds": pd.DatetimeIndex(X.index),
+                }
+            )
 
         try:
-            forecast_df = self._nf.predict(futr_df=futr_df)
-        except Exception:
-            # Якщо futr_df не приймається — predict без аргументів
-            forecast_df = self._nf.predict()
+            forecast_df = self.nf.predict(futr_df=futr_df)
+        except TypeError:
+            forecast_df = self.nf.predict()
 
         exclude = {"unique_id", "ds"}
-        model_cols = [col for col in forecast_df.columns if col not in exclude]
+        model_cols = [c for c in forecast_df.columns if c not in exclude]
 
-        if not model_cols:
-            raise ValueError("No forecast columns in neuralforecast output")
-
-        # Для quantile моделей (TFT) беремо медіану q50
         median_col = next(
-            (col for col in model_cols if "50" in col or "median" in col.lower()),
+            (c for c in model_cols if "50" in c or "median" in c.lower()),
             model_cols[0],
         )
 
-        # Фільтруємо та реіндексуємо на дати X_test
-        forecast_df = forecast_df.set_index("ds")
-        result = forecast_df.reindex(X.index)[median_col].values
+        # Беремо тільки перші len(X_test) рядків
+        result = forecast_df[median_col].values[: len(X)]
 
-        if np.isnan(result).any():
-            self._logger.warning(
-                "NaN in predictions after reindex: {count} values",
-                count=int(np.isnan(result).sum()),
+        if len(result) != len(X):
+            logger.error(
+                f"Length mismatch: got {len(result)}, "
+                f"expected {len(X)}"
             )
 
         return result
