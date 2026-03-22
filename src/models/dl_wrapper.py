@@ -175,6 +175,16 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             except Exception:
                 forecast_df = self._nf.predict()
 
+        logger.info(
+            "DL Predict Diagnostics - shape: {shape}, cols: {cols}",
+            shape=forecast_df.shape,
+            cols=list(forecast_df.columns),
+        )
+        if "ds" in forecast_df.columns:
+            logger.info("DL Predict Diagnostics - unique ds count: {count}", count=forecast_df["ds"].nunique())
+        elif forecast_df.index.name == "ds":
+            logger.info("DL Predict Diagnostics - unique ds count (index): {count}", count=forecast_df.index.nunique())
+
         if not isinstance(forecast_df, pd.DataFrame):
             raise ValueError("NeuralForecast predict must return a DataFrame")
 

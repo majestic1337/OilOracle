@@ -32,6 +32,8 @@ class WFVConfig:
     corr_threshold: float = 0.85
     top_k_shap: int = 15
     random_state: int = 42
+    dl_mode: str = "per_fold"
+    max_consecutive_failures: int = 3
 
     @property
     def model_kwargs(self) -> dict:
@@ -418,6 +420,11 @@ def run_wfv(
     predictions_list: list[pd.Series] = []
     skip_model = False
     skip_reason = ""
+    consecutive_failures = 0
+
+    global_trained = False
+    global_selected_features: list[str] | None = None
+    global_scaler: RobustScaler | None = None
 
     for fold_idx, (train_start, train_end, val_end, test_end) in enumerate(
         _iter_windows(len(X), config)
@@ -430,55 +437,87 @@ def run_wfv(
         X_val = X.iloc[val_slice]
         X_test = X.iloc[test_slice]
 
-        y_train = y_model.iloc[train_slice]
-        y_val = y_model.iloc[val_slice]
-        y_test = y_model.iloc[test_slice]
-
-        scaler = RobustScaler()
-        X_train_scaled = pd.DataFrame(
-            scaler.fit_transform(X_train),
-            index=X_train.index,
-            columns=X_train.columns,
-        )
-        X_val_scaled = pd.DataFrame(
-            scaler.transform(X_val),
-            index=X_val.index,
-            columns=X_val.columns,
-        )
-        X_test_scaled = pd.DataFrame(
-            scaler.transform(X_test),
-            index=X_test.index,
-            columns=X_test.columns,
-        )
-
-        if isinstance(y_train, pd.DataFrame) and mimo_target_col is not None:
-            selection_target = y_train[mimo_target_col]
+        if config.dl_mode == "global_train" and global_trained and global_scaler is not None and global_selected_features is not None:
+            # Reuse globally trained artifacts for testing
+            scaler = global_scaler
+            selected_features = global_selected_features
+            
+            X_test_scaled = pd.DataFrame(
+                scaler.transform(X_test),
+                index=X_test.index,
+                columns=X_test.columns,
+            )
+            X_test_sel = X_test_scaled[selected_features]
+            
+            # Create dummy arrays since we skip training
+            X_train_sel = pd.DataFrame()
+            X_val_sel = pd.DataFrame()
+            
+            # Still need actuals for audit
+            if isinstance(y_test, pd.DataFrame) and mimo_target_col is not None:
+                actuals_series = y_test[mimo_target_col]
+            else:
+                actuals_series = _ensure_series(y_test, config.horizon)
+            actuals_array = np.asarray(actuals_series).astype(float)
         else:
-            selection_target = _ensure_series(y_train, config.horizon)
-        selected_features = select_features_in_fold(X_train_scaled, selection_target, config)
-        if not selected_features:
-            logger.warning("No features selected in fold {fold}; using all features", fold=fold_idx)
-            selected_features = list(X_train_scaled.columns)
+            y_train = y_model.iloc[train_slice]
+            y_val = y_model.iloc[val_slice]
+            y_test = y_model.iloc[test_slice]
 
-        X_train_sel = X_train_scaled[selected_features]
-        X_val_sel = X_val_scaled[selected_features]
-        X_test_sel = X_test_scaled[selected_features]
+            scaler = RobustScaler()
+            X_train_scaled = pd.DataFrame(
+                scaler.fit_transform(X_train),
+                index=X_train.index,
+                columns=X_train.columns,
+            )
+            X_val_scaled = pd.DataFrame(
+                scaler.transform(X_val),
+                index=X_val.index,
+                columns=X_val.columns,
+            )
+            X_test_scaled = pd.DataFrame(
+                scaler.transform(X_test),
+                index=X_test.index,
+                columns=X_test.columns,
+            )
+
+            if isinstance(y_train, pd.DataFrame) and mimo_target_col is not None:
+                selection_target = y_train[mimo_target_col]
+            else:
+                selection_target = _ensure_series(y_train, config.horizon)
+            selected_features = select_features_in_fold(X_train_scaled, selection_target, config)
+            if not selected_features:
+                logger.warning("No features selected in fold {fold}; using all features", fold=fold_idx)
+                selected_features = list(X_train_scaled.columns)
+
+            X_train_sel = X_train_scaled[selected_features]
+            X_val_sel = X_val_scaled[selected_features]
+            X_test_sel = X_test_scaled[selected_features]
+
+            if isinstance(y_test, pd.DataFrame) and mimo_target_col is not None:
+                actuals_series = y_test[mimo_target_col]
+            else:
+                actuals_series = _ensure_series(y_test, config.horizon)
+            actuals_array = np.asarray(actuals_series).astype(float)
 
         fit_time = 0.0
         preds_array: np.ndarray = np.array([])
-        if isinstance(y_test, pd.DataFrame) and mimo_target_col is not None:
-            actuals_series = y_test[mimo_target_col]
-        else:
-            actuals_series = _ensure_series(y_test, config.horizon)
-        actuals_array = np.asarray(actuals_series).astype(float)
 
         try:
             start_time = time.perf_counter()
-            try:
-                model.fit(X_train_sel, y_train, X_val=X_val_sel, y_val=y_val)
-            except TypeError:
-                model.fit(X_train_sel, y_train)
-            fit_time = time.perf_counter() - start_time
+            if config.dl_mode == "global_train" and global_trained:
+                pass  # Skip retraining
+            else:
+                try:
+                    model.fit(X_train_sel, y_train, X_val=X_val_sel, y_val=y_val)
+                except TypeError:
+                    model.fit(X_train_sel, y_train)
+                fit_time = time.perf_counter() - start_time
+                
+                if config.dl_mode == "global_train":
+                    global_trained = True
+                    global_scaler = scaler
+                    global_selected_features = selected_features
 
             preds = model.predict(X_test_sel)
             preds_array = np.asarray(preds)
@@ -491,7 +530,10 @@ def run_wfv(
             preds_array = preds_array.astype(float)
 
             predictions_list.append(pd.Series(preds_array, index=X_test_sel.index))
+            consecutive_failures = 0
+            
         except Exception as exc:  # noqa: BLE001 - keep pipeline running
+            consecutive_failures += 1
             if _is_incompatible_model_error(exc, config.horizon):
                 skip_model = True
                 skip_reason = str(exc)
@@ -501,7 +543,14 @@ def run_wfv(
                     error=skip_reason,
                 )
                 break
+                
             logger.error("Model failed on fold {fold}: {error}", fold=fold_idx, error=str(exc))
+            
+            if consecutive_failures >= config.max_consecutive_failures:
+                skip_model = True
+                skip_reason = f"Model failed {config.max_consecutive_failures} consecutive times. Aborting WFV."
+                logger.error(skip_reason)
+                break
 
         iterations.append(
             WFVIteration(
