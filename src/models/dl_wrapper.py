@@ -132,15 +132,18 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self.nf = self._nf
 
         if X_val is not None and y_val is not None:
+            df_val = self._prepare_df(X_val, y_val)
+            df_full = pd.concat([df_train, df_val], ignore_index=True)
+            df_full = df_full.sort_values(["unique_id", "ds"]).reset_index(drop=True)
             val_size = len(y_val)
-            self._nf.fit(df_train, val_size=val_size)
+            self._nf.fit(df_full, val_size=val_size)
+            self._last_train_df = df_full
         else:
             # Без val — вимикаємо early stopping щоб уникнути помилки
             for model in self._nf.models:
                 model.early_stop_patience_steps = -1
             self._nf.fit(df_train)
-
-        self._last_train_df = df_train
+            self._last_train_df = df_train
 
         return self
 
