@@ -155,13 +155,11 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         if len(forecast_df) != len(futr_df):
             self._logger.warning(
-                "Forecast length {pred_len} does not match future length {future_len}; retrying in chunks",
+                "Forecast length {pred_len} does not match future length {future_len}; aligning only",
                 pred_len=len(forecast_df),
                 future_len=len(futr_df),
             )
-            forecast_df = self._predict_in_chunks(futr_df, chunk_size=1)
 
-        forecast_df = self._normalize_forecast_df(forecast_df, futr_df)
         forecast_df = self._align_forecast_to_future(forecast_df, futr_df)
 
         logger.info(
@@ -181,7 +179,7 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             raise ValueError("X_test is empty")
 
         last_date = self._last_train_df["ds"].max() if self._last_train_df is not None else pd.Timestamp.now()
-        expected_dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:]
+        expected_dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:].normalize()
 
         use_x_index = False
         ds_index: pd.DatetimeIndex | None = None
@@ -189,6 +187,9 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             ds_index = pd.DatetimeIndex(X_test.index)
             if ds_index.isna().any():
                 raise ValueError("X_test index contains NaT values")
+            if ds_index.tz is not None:
+                ds_index = ds_index.tz_convert(None)
+            ds_index = ds_index.normalize()
             if len(ds_index) == len(expected_dates) and ds_index.equals(expected_dates):
                 use_x_index = True
             else:
@@ -221,6 +222,10 @@ class DeepLearningForecasterWrapper(BaseForecaster):
                 exog_df = X_test.copy()
                 exog_df = exog_df.reset_index().rename(columns={exog_df.index.name or "index": "ds"})
                 exog_df["ds"] = pd.to_datetime(exog_df["ds"])
+                if exog_df["ds"].dt.tz is not None:
+                    exog_df["ds"] = exog_df["ds"].dt.tz_convert(None)
+                exog_df["ds"] = exog_df["ds"].dt.normalize()
+                futr_df["ds"] = pd.to_datetime(futr_df["ds"]).dt.normalize()
                 merged = futr_df[["ds"]].merge(exog_df, on="ds", how="left")
                 for col in self._exog_columns:
                     if col in merged.columns:
