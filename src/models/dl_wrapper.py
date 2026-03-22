@@ -180,40 +180,60 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         if X_test.empty:
             raise ValueError("X_test is empty")
 
-        futr_df: pd.DataFrame | None = None
+        last_date = self._last_train_df["ds"].max() if self._last_train_df is not None else pd.Timestamp.now()
+        expected_dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:]
+
+        use_x_index = False
+        ds_index: pd.DatetimeIndex | None = None
         try:
             ds_index = pd.DatetimeIndex(X_test.index)
             if ds_index.isna().any():
                 raise ValueError("X_test index contains NaT values")
-            futr_df = pd.DataFrame({"unique_id": "brent", "ds": ds_index})
+            if len(ds_index) == len(expected_dates) and ds_index.equals(expected_dates):
+                use_x_index = True
+            else:
+                self._logger.warning(
+                    "X_test index not continuous/expected; using business-day future dates from {start}",
+                    start=last_date,
+                )
         except Exception as exc:  # noqa: BLE001 - defensive fallback
             self._logger.warning(
-                "Failed to build future df from X_test index; falling back to continuous dates: {error}",
+                "Failed to use X_test index for future df; falling back to continuous dates: {error}",
                 error=str(exc),
             )
 
-        if futr_df is None:
-            try:
-                futr_df = self._nf.make_future_dataframe(df=self._last_train_df)
-            except Exception:
-                futr_df = None
-
-        if futr_df is None or len(futr_df) != len(X_test):
-            last_date = (
-                self._last_train_df["ds"].max() if self._last_train_df is not None else pd.Timestamp.now()
-            )
-            dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:]
-            futr_df = pd.DataFrame({"unique_id": "brent", "ds": dates})
+        if use_x_index and ds_index is not None:
+            futr_df = pd.DataFrame({"unique_id": "brent", "ds": ds_index})
+        else:
+            futr_df = pd.DataFrame({"unique_id": "brent", "ds": expected_dates})
 
         if self._supports_exogenous():
-            for col in self._exog_columns:
-                if col in X_test.columns:
-                    vals = X_test[col].values
-                    if len(vals) < len(futr_df):
-                        vals = np.pad(vals, (0, len(futr_df) - len(vals)), mode="edge")
-                    elif len(vals) > len(futr_df):
-                        vals = vals[: len(futr_df)]
-                    futr_df[col] = vals
+            if use_x_index:
+                for col in self._exog_columns:
+                    if col in X_test.columns:
+                        vals = X_test[col].values
+                        if len(vals) < len(futr_df):
+                            vals = np.pad(vals, (0, len(futr_df) - len(vals)), mode="edge")
+                        elif len(vals) > len(futr_df):
+                            vals = vals[: len(futr_df)]
+                        futr_df[col] = vals
+            else:
+                exog_df = X_test.copy()
+                exog_df = exog_df.reset_index().rename(columns={exog_df.index.name or "index": "ds"})
+                exog_df["ds"] = pd.to_datetime(exog_df["ds"])
+                merged = futr_df[["ds"]].merge(exog_df, on="ds", how="left")
+                for col in self._exog_columns:
+                    if col in merged.columns:
+                        series = merged[col]
+                        if series.isna().any():
+                            series = series.ffill().bfill()
+                            if series.isna().any():
+                                series = series.fillna(0.0)
+                                self._logger.warning(
+                                    "Filled remaining NaNs for exogenous feature {col} with 0.0",
+                                    col=col,
+                                )
+                        futr_df[col] = series.values
 
         return futr_df
 
