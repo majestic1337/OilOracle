@@ -85,6 +85,16 @@ def _ensure_series(y: pd.Series | pd.DataFrame, horizon: int) -> pd.Series | pd.
     return y.iloc[:, 0]
 
 
+def _is_incompatible_model_error(error: Exception, horizon: int) -> bool:
+    message = str(error).lower()
+    if horizon == 1 and "h=1" in message and "incompatible" in message:
+        if "seasonality" in message or "trend" in message:
+            return True
+    if "does not support future exogenous" in message:
+        return True
+    return False
+
+
 def _select_features_granger(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -406,6 +416,8 @@ def run_wfv(
 
     iterations: list[WFVIteration] = []
     predictions_list: list[pd.Series] = []
+    skip_model = False
+    skip_reason = ""
 
     for fold_idx, (train_start, train_end, val_end, test_end) in enumerate(
         _iter_windows(len(X), config)
@@ -480,6 +492,15 @@ def run_wfv(
 
             predictions_list.append(pd.Series(preds_array, index=X_test_sel.index))
         except Exception as exc:  # noqa: BLE001 - keep pipeline running
+            if _is_incompatible_model_error(exc, config.horizon):
+                skip_model = True
+                skip_reason = str(exc)
+                logger.warning(
+                    "Skipping model after incompatibility on fold {fold}: {error}",
+                    fold=fold_idx,
+                    error=skip_reason,
+                )
+                break
             logger.error("Model failed on fold {fold}: {error}", fold=fold_idx, error=str(exc))
 
         iterations.append(
@@ -500,6 +521,10 @@ def run_wfv(
             )
         )
 
+    if skip_model:
+        iterations = []
+        predictions_list = []
+
     if predictions_list:
         predictions_series = pd.concat(predictions_list).sort_index()
     else:
@@ -509,6 +534,58 @@ def run_wfv(
     predictions_series.attrs["horizon"] = config.horizon
 
     return iterations, predictions_series
+
+
+def load_cached_results(
+    model_name: str,
+    horizon: int,
+    output_dir: str | Path,
+) -> tuple[list[WFVIteration], pd.Series] | None:
+    """Load cached predictions/audit if present.
+
+    Args:
+        model_name: Name of the model used.
+        horizon: Forecast horizon.
+        output_dir: Directory for output artifacts.
+
+    Returns:
+        Tuple of empty iterations list and predictions series if cache exists,
+        otherwise None.
+    """
+    output_path = Path(output_dir)
+    predictions_path = output_path / f"predictions_{model_name}_{horizon}.parquet"
+    audit_path = output_path / f"audit_{model_name}_{horizon}.json"
+
+    if not (predictions_path.exists() and audit_path.exists()):
+        return None
+
+    try:
+        predictions_df = pd.read_parquet(predictions_path)
+        if predictions_df.empty:
+            logger.warning(
+                "Cached predictions empty for {model} horizon {h}; rerunning WFV",
+                model=model_name,
+                h=horizon,
+            )
+            return None
+        predictions = predictions_df.iloc[:, 0].copy()
+        predictions.name = predictions_df.columns[0]
+        predictions.attrs["horizon"] = horizon
+    except Exception as exc:  # noqa: BLE001 - fallback to recompute
+        logger.warning(
+            "Failed to load cached predictions for {model} horizon {h}: {error}",
+            model=model_name,
+            h=horizon,
+            error=str(exc),
+        )
+        return None
+
+    logger.info(
+        "Using cached WFV results for {model} horizon {h}; skipping training",
+        model=model_name,
+        h=horizon,
+    )
+    return [], predictions
 
 
 def save_wfv_results(

@@ -55,7 +55,6 @@ class TFTForecaster(DeepLearningForecasterWrapper):
             "early_stop_patience_steps": 10,
             "random_seed": 42,
             "accelerator": "cpu",
-            "devices": 1,
         }
         signature = inspect.signature(TFT)
         if "num_encoder_layers" in signature.parameters:
@@ -118,22 +117,7 @@ class TFTForecaster(DeepLearningForecasterWrapper):
         if alpha != 0.1:
             logger.warning("TFT uses fixed quantiles; ignoring alpha override")
 
-        if self._nf is None:
-            raise ValueError("Model must be fitted before prediction")
-
-        futr_df = pd.DataFrame(
-            {
-                "unique_id": "brent",
-                "ds": pd.DatetimeIndex(X.index),
-            }
-        )
-        for col in X.columns:
-            futr_df[col] = X[col].values
-
-        try:
-            forecast_df = self._nf.predict(futr_df=futr_df)
-        except Exception:
-            forecast_df = self._nf.predict()
+        forecast_df = self._predict_df(X)
 
         exclude = {"unique_id", "ds"}
         model_cols = [col for col in forecast_df.columns if col not in exclude]
@@ -145,8 +129,7 @@ class TFTForecaster(DeepLearningForecasterWrapper):
         if q10_col is None or q90_col is None:
             raise ValueError("Quantile outputs not found for TFT; ensure QuantileLoss is enabled")
 
-        forecast_df = forecast_df.set_index("ds")
-        lower = forecast_df.reindex(X.index)[q10_col].to_numpy(dtype=float)
-        upper = forecast_df.reindex(X.index)[q90_col].to_numpy(dtype=float)
+        lower = forecast_df[q10_col].values[: len(X)]
+        upper = forecast_df[q90_col].values[: len(X)]
 
         return lower, upper

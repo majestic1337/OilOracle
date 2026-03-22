@@ -55,11 +55,13 @@ class NBEATSForecaster(DeepLearningForecasterWrapper):
             random_seed=42,
             accelerator="cpu",
         )
+        model_kwargs = {k: v for k, v in params.items() if k not in {"h", "input_size"}}
 
         self.model_instance = NBEATS(**params)
         super().__init__(
             model_class=NBEATS,
             horizon=horizon,
             input_size=input_size,
+            **model_kwargs,
         )
         self.model_instance = NBEATS(**params)

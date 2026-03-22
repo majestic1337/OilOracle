@@ -38,12 +38,14 @@ class PatchTSTForecaster(DeepLearningForecasterWrapper):
             random_seed=42,
             accelerator="cpu",
         )
+        model_kwargs = {k: v for k, v in params.items() if k not in {"h", "input_size"}}
         self.model_instance = PatchTST(**params)
 
         super().__init__(
             model_class=PatchTST,
             horizon=horizon,
             input_size=input_size,
+            **model_kwargs,
         )
 
         # Перевизначаємо model_instance після super().__init__

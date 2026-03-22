@@ -71,12 +71,15 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             df["y"] = y.values
 
         # PatchTST не підтримує exogenous variables
-        model_name = type(self.model_instance).__name__
-        if model_name != "PatchTST":
+        if self._supports_exogenous():
             for col in X.columns:
                 df[col] = X[col].values
 
         return df
+
+    def _supports_exogenous(self) -> bool:
+        model_name = self.model_class.__name__ if self.model_class is not None else ""
+        return model_name not in {"PatchTST"}
 
     def _build_model(self, exog_columns: list[str]) -> Any:
         model_kwargs = dict(self.model_kwargs)
@@ -88,11 +91,15 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         if "accelerator" not in model_kwargs:
             model_kwargs["accelerator"] = self._accelerator
+            
+        if model_kwargs.get("accelerator") == "cpu" and "devices" not in model_kwargs:
+            model_kwargs["devices"] = 1
 
         signature = inspect.signature(self.model_class)
-        for param in ("futr_exog_list", "hist_exog_list"):
-            if param in signature.parameters and exog_columns and param not in model_kwargs:
-                model_kwargs[param] = exog_columns
+        if self._supports_exogenous():
+            for param in ("futr_exog_list", "hist_exog_list"):
+                if param in signature.parameters and exog_columns and param not in model_kwargs:
+                    model_kwargs[param] = exog_columns
 
         return self.model_class(**model_kwargs)
 
@@ -107,7 +114,7 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         if X_train.empty:
             raise ValueError("X_train is empty")
 
-        self._exog_columns = list(X_train.columns)
+        self._exog_columns = list(X_train.columns) if self._supports_exogenous() else []
         df_train = self._prepare_df(X_train, y_train)
 
         try:
@@ -141,12 +148,32 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         if self._nf is None:
             raise ValueError("Model must be fitted before prediction")
 
-        df_test = self._prepare_df(X_test)
+        # Generate strictly continuous future dates to avoid NeuralForecast missing combinations errors.
+        try:
+            futr_df = self._nf.make_future_dataframe(df=self._last_train_df)
+        except Exception:
+            last_date = self._last_train_df["ds"].max() if self._last_train_df is not None else pd.Timestamp.now()
+            dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:]
+            futr_df = pd.DataFrame({"unique_id": "brent", "ds": dates})
+            
+        # Manually align exogenous variables
+        if self._supports_exogenous():
+            for col in self._exog_columns:
+                if col in X_test.columns:
+                    vals = X_test[col].values
+                    if len(vals) < len(futr_df):
+                        vals = np.pad(vals, (0, len(futr_df) - len(vals)), mode="edge")
+                    elif len(vals) > len(futr_df):
+                        vals = vals[: len(futr_df)]
+                    futr_df[col] = vals
 
         try:
-            forecast_df = self._nf.predict(futr_df=df_test)
+            forecast_df = self._nf.predict(futr_df=futr_df)
         except TypeError:
-            forecast_df = self._nf.predict(df=df_test)
+            try:
+                forecast_df = self._nf.predict(df=futr_df)
+            except Exception:
+                forecast_df = self._nf.predict()
 
         if not isinstance(forecast_df, pd.DataFrame):
             raise ValueError("NeuralForecast predict must return a DataFrame")
@@ -162,40 +189,21 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         return columns[0]
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        # Використовуємо make_future_dataframe для коректних дат
-        try:
-            futr_df = self.nf.make_future_dataframe(
-                h=self.horizon,
-                data=self._last_train_df,
-            )
-        except Exception:
-            futr_df = pd.DataFrame(
-                {
-                    "unique_id": "brent",
-                    "ds": pd.DatetimeIndex(X.index),
-                }
-            )
-
-        try:
-            forecast_df = self.nf.predict(futr_df=futr_df)
-        except TypeError:
-            forecast_df = self.nf.predict()
+        forecast_df = self._predict_df(X)
 
         exclude = {"unique_id", "ds"}
         model_cols = [c for c in forecast_df.columns if c not in exclude]
 
-        median_col = next(
-            (c for c in model_cols if "50" in c or "median" in c.lower()),
-            model_cols[0],
-        )
+        median_col = self._select_point_column(model_cols)
 
-        # Беремо тільки перші len(X_test) рядків
+        # Беремо тільки перші len(X) рядків
         result = forecast_df[median_col].values[: len(X)]
 
         if len(result) != len(X):
             logger.error(
-                f"Length mismatch: got {len(result)}, "
-                f"expected {len(X)}"
+                "Length mismatch: got {res_len}, expected {x_len}",
+                res_len=len(result),
+                x_len=len(X),
             )
 
         return result
