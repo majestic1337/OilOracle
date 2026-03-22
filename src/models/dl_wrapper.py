@@ -148,32 +148,21 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         if self._nf is None:
             raise ValueError("Model must be fitted before prediction")
 
-        # Generate strictly continuous future dates to avoid NeuralForecast missing combinations errors.
-        try:
-            futr_df = self._nf.make_future_dataframe(df=self._last_train_df)
-        except Exception:
-            last_date = self._last_train_df["ds"].max() if self._last_train_df is not None else pd.Timestamp.now()
-            dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:]
-            futr_df = pd.DataFrame({"unique_id": "brent", "ds": dates})
-            
-        # Manually align exogenous variables
-        if self._supports_exogenous():
-            for col in self._exog_columns:
-                if col in X_test.columns:
-                    vals = X_test[col].values
-                    if len(vals) < len(futr_df):
-                        vals = np.pad(vals, (0, len(futr_df) - len(vals)), mode="edge")
-                    elif len(vals) > len(futr_df):
-                        vals = vals[: len(futr_df)]
-                    futr_df[col] = vals
+        futr_df = self._build_future_df(X_test)
 
-        try:
-            forecast_df = self._nf.predict(futr_df=futr_df)
-        except TypeError:
-            try:
-                forecast_df = self._nf.predict(df=futr_df)
-            except Exception:
-                forecast_df = self._nf.predict()
+        forecast_df = self._predict_with_futr_df(futr_df)
+        forecast_df = self._normalize_forecast_df(forecast_df, futr_df)
+
+        if len(forecast_df) != len(futr_df):
+            self._logger.warning(
+                "Forecast length {pred_len} does not match future length {future_len}; retrying in chunks",
+                pred_len=len(forecast_df),
+                future_len=len(futr_df),
+            )
+            forecast_df = self._predict_in_chunks(futr_df, chunk_size=1)
+
+        forecast_df = self._normalize_forecast_df(forecast_df, futr_df)
+        forecast_df = self._align_forecast_to_future(forecast_df, futr_df)
 
         logger.info(
             "DL Predict Diagnostics - shape: {shape}, cols: {cols}",
@@ -185,10 +174,127 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         elif forecast_df.index.name == "ds":
             logger.info("DL Predict Diagnostics - unique ds count (index): {count}", count=forecast_df.index.nunique())
 
+        return forecast_df
+
+    def _build_future_df(self, X_test: pd.DataFrame) -> pd.DataFrame:
+        if X_test.empty:
+            raise ValueError("X_test is empty")
+
+        futr_df: pd.DataFrame | None = None
+        try:
+            ds_index = pd.DatetimeIndex(X_test.index)
+            if ds_index.isna().any():
+                raise ValueError("X_test index contains NaT values")
+            futr_df = pd.DataFrame({"unique_id": "brent", "ds": ds_index})
+        except Exception as exc:  # noqa: BLE001 - defensive fallback
+            self._logger.warning(
+                "Failed to build future df from X_test index; falling back to continuous dates: {error}",
+                error=str(exc),
+            )
+
+        if futr_df is None:
+            try:
+                futr_df = self._nf.make_future_dataframe(df=self._last_train_df)
+            except Exception:
+                futr_df = None
+
+        if futr_df is None or len(futr_df) != len(X_test):
+            last_date = (
+                self._last_train_df["ds"].max() if self._last_train_df is not None else pd.Timestamp.now()
+            )
+            dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:]
+            futr_df = pd.DataFrame({"unique_id": "brent", "ds": dates})
+
+        if self._supports_exogenous():
+            for col in self._exog_columns:
+                if col in X_test.columns:
+                    vals = X_test[col].values
+                    if len(vals) < len(futr_df):
+                        vals = np.pad(vals, (0, len(futr_df) - len(vals)), mode="edge")
+                    elif len(vals) > len(futr_df):
+                        vals = vals[: len(futr_df)]
+                    futr_df[col] = vals
+
+        return futr_df
+
+    def _predict_with_futr_df(self, futr_df: pd.DataFrame) -> pd.DataFrame:
+        try:
+            forecast_df = self._nf.predict(futr_df=futr_df)
+        except TypeError:
+            try:
+                forecast_df = self._nf.predict(df=futr_df)
+            except Exception:
+                forecast_df = self._nf.predict()
+        return forecast_df
+
+    @staticmethod
+    def _normalize_forecast_df(
+        forecast_df: pd.DataFrame,
+        futr_df: pd.DataFrame,
+    ) -> pd.DataFrame:
         if not isinstance(forecast_df, pd.DataFrame):
             raise ValueError("NeuralForecast predict must return a DataFrame")
 
-        return forecast_df
+        df = forecast_df.copy()
+        if "ds" not in df.columns:
+            if df.index.name == "ds" or (
+                isinstance(df.index, pd.MultiIndex) and "ds" in df.index.names
+            ):
+                df = df.reset_index()
+
+        if "ds" not in df.columns:
+            df.insert(0, "ds", futr_df["ds"].values[: len(df)])
+
+        if "unique_id" not in df.columns:
+            df.insert(0, "unique_id", futr_df["unique_id"].values[: len(df)])
+
+        return df
+
+    def _align_forecast_to_future(
+        self,
+        forecast_df: pd.DataFrame,
+        futr_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if "ds" not in forecast_df.columns:
+            return forecast_df
+
+        df = forecast_df.copy()
+        df["ds"] = pd.to_datetime(df["ds"])
+        base = futr_df.copy()
+        base["ds"] = pd.to_datetime(base["ds"])
+
+        merge_cols = ["ds"]
+        if "unique_id" in df.columns and "unique_id" in base.columns:
+            merge_cols = ["unique_id", "ds"]
+
+        df = df.drop_duplicates(subset=merge_cols, keep="last")
+        aligned = base[merge_cols].merge(df, on=merge_cols, how="left")
+
+        pred_cols = [col for col in aligned.columns if col not in {"unique_id", "ds"}]
+        if pred_cols and aligned[pred_cols].isna().any().any():
+            aligned[pred_cols] = aligned[pred_cols].ffill().bfill()
+            if aligned[pred_cols].isna().any().any():
+                aligned[pred_cols] = aligned[pred_cols].fillna(0.0)
+                self._logger.warning("Filled remaining NaNs in forecast output with 0.0")
+
+        return aligned
+
+    def _predict_in_chunks(self, futr_df: pd.DataFrame, chunk_size: int) -> pd.DataFrame:
+        if chunk_size <= 0:
+            chunk_size = 1
+
+        chunks: list[pd.DataFrame] = []
+        for start in range(0, len(futr_df), chunk_size):
+            chunk = futr_df.iloc[start : start + chunk_size].copy()
+            forecast_chunk = self._predict_with_futr_df(chunk)
+            forecast_chunk = self._normalize_forecast_df(forecast_chunk, chunk)
+            forecast_chunk = self._align_forecast_to_future(forecast_chunk, chunk)
+            chunks.append(forecast_chunk)
+
+        if not chunks:
+            return pd.DataFrame()
+
+        return pd.concat(chunks, ignore_index=True)
 
     @staticmethod
     def _select_point_column(columns: list[str]) -> str:
@@ -204,16 +310,36 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         exclude = {"unique_id", "ds"}
         model_cols = [c for c in forecast_df.columns if c not in exclude]
 
+        if not model_cols:
+            raise ValueError("No prediction columns returned by NeuralForecast")
+
         median_col = self._select_point_column(model_cols)
 
-        # Беремо тільки перші len(X) рядків
-        result = forecast_df[median_col].values[: len(X)]
+        if "ds" in forecast_df.columns:
+            df = forecast_df.copy()
+            df["ds"] = pd.to_datetime(df["ds"])
+            df = df.drop_duplicates(subset=["ds"], keep="last").set_index("ds")
+            target_index = pd.DatetimeIndex(X.index)
+            series = df[median_col].reindex(target_index)
+            if series.isna().any():
+                series = series.ffill().bfill()
+                if series.isna().any():
+                    series = series.fillna(0.0)
+            result = series.to_numpy(dtype=float)
+        else:
+            result = forecast_df[median_col].to_numpy(dtype=float)
 
         if len(result) != len(X):
-            logger.error(
-                "Length mismatch: got {res_len}, expected {x_len}",
+            self._logger.warning(
+                "Length mismatch after alignment: got {res_len}, expected {x_len}",
                 res_len=len(result),
                 x_len=len(X),
             )
+            if len(result) == 0:
+                result = np.zeros(len(X), dtype=float)
+            elif len(result) > len(X):
+                result = result[: len(X)]
+            else:
+                result = np.pad(result, (0, len(X) - len(result)), mode="edge")
 
         return result
