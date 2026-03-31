@@ -30,16 +30,15 @@ def _first_column_series(X: Any) -> np.ndarray:
 
 
 class RandomWalkModel(BaseForecaster):
-    """Random-walk baseline: the best forecast is the last observed value.
+    """Random-walk baseline for stationary financial returns.
 
-    This model intentionally mirrors the financial econometrics baseline where
-    returns are difficult to predict; it provides a hard-to-beat benchmark for
-    short-horizon forecasts.
+    For log-returns, the naive forecast assumes the expected return is zero
+    (price remains unchanged). Prediction intervals are based on recent historical volatility.
     """
 
     def __init__(self, window: int = 20) -> None:
         self.window = window
-        self._last_value: float | None = None
+        self._expected_return: float = 0.0
         self._rolling_std: float | None = None
         self._logger = logger.bind(model=self.__class__.__name__)
 
@@ -50,17 +49,12 @@ class RandomWalkModel(BaseForecaster):
         X_val: Any | None = None,
         y_val: Any | None = None,
     ) -> "RandomWalkModel":
-        """Store the last observed value and rolling volatility.
-
-        We keep the last observed value because a random walk assumes tomorrow's
-        best guess is today's realization. A short rolling window approximates
-        recent volatility for the prediction interval.
-        """
-        series = _as_1d_array(y_train)
+        series = np.asarray(y_train, dtype=float)
+        if series.ndim > 1:
+            series = series.squeeze()
+            
         if series.size == 0:
             raise ValueError("y_train is empty; cannot fit RandomWalkModel")
-
-        self._last_value = float(series[-1])
 
         window = min(self.window, len(series))
         if window < 2:
@@ -72,29 +66,19 @@ class RandomWalkModel(BaseForecaster):
         return self
 
     def predict(self, X: Any) -> np.ndarray:
-        """Repeat the last observed value for each forecast step."""
-        if self._last_value is None:
-            raise ValueError("RandomWalkModel must be fitted before prediction")
-
         steps = len(X) if hasattr(X, "__len__") else 1
-        return np.full(steps, self._last_value, dtype=float)
+        return np.full(steps, self._expected_return, dtype=float)
 
-    def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
-        """Return a symmetric interval based on recent volatility.
-
-        The interval uses ±1.96 standard deviations for a classical 95% band,
-        matching econometric reporting norms used in the experiment.
-        """
-        if self._last_value is None:
-            raise ValueError("RandomWalkModel must be fitted before prediction")
-
+    def predict_interval(self, X: Any, alpha: float = 0.05) -> tuple[np.ndarray, np.ndarray]:
         steps = len(X) if hasattr(X, "__len__") else 1
         std = float(self._rolling_std) if self._rolling_std is not None else float("nan")
+        
         z = 1.96
-        lower = np.full(steps, self._last_value - z * std, dtype=float)
-        upper = np.full(steps, self._last_value + z * std, dtype=float)
+        
+        lower = np.full(steps, self._expected_return - z * std, dtype=float)
+        upper = np.full(steps, self._expected_return + z * std, dtype=float)
         return lower, upper
-
+    
 
 class DLinearModel(BaseForecaster):
     """Linear autoregressive baseline for log-returns.

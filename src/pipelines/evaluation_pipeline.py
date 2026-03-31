@@ -45,7 +45,7 @@ def _extract_prediction_series(df: pd.DataFrame) -> pd.Series:
     lower_col = _select_column(df, ["lower", "q0.1", "q10", "p10"])
     upper_col = _select_column(df, ["upper", "q0.9", "q90", "p90"])
     if lower_col and upper_col:
-        interval_width = (df[upper_col] - df[lower_col]).to_numpy(dtype=float)
+        interval_width = df[upper_col] - df[lower_col]
         series.attrs["interval_width"] = interval_width
 
     return _to_series(series)
@@ -63,13 +63,13 @@ def _parse_prediction_name(path: Path) -> str:
 
 
 def load_all_predictions(processed_dir: str | Path) -> dict[str, pd.Series]:
-    """Load all prediction files from the processed directory.
+    """Load all prediction files from the processed directory and align indices.
 
     Args:
         processed_dir: Directory containing prediction parquet files.
 
     Returns:
-        Dictionary mapping model_horizon names to prediction series.
+        Dictionary mapping model_horizon names to aligned prediction series.
     """
     processed_path = Path(processed_dir)
     files = sorted(processed_path.glob("predictions_*.parquet"))
@@ -85,15 +85,22 @@ def load_all_predictions(processed_dir: str | Path) -> dict[str, pd.Series]:
         key = _parse_prediction_name(file_path)
         predictions[key] = series
 
-    indices = [series.index for series in predictions.values()]
-    base_index = indices[0]
-    for key, idx in zip(predictions.keys(), indices, strict=False):
-        if not idx.equals(base_index):
-            diff = base_index.symmetric_difference(idx)
-            raise ValueError(
-                f"Prediction index mismatch for {key}. "
-                f"Diff count: {len(diff)}"
-            )
+    if not predictions:
+        return predictions
+
+    # Знаходження спільного перетину індексів для всіх моделей
+    common_index = predictions[list(predictions.keys())[0]].index
+    for series in predictions.values():
+        common_index = common_index.intersection(series.index)
+
+    if common_index.empty:
+        logger.warning("Common index across all predictions is empty.")
+
+    # Вирівнювання всіх прогнозів за спільним індексом
+    for key in predictions:
+        predictions[key] = predictions[key].loc[common_index]
+
+    logger.info("Aligned all predictions to a common index of length {n}", n=len(common_index))
 
     return predictions
 
@@ -153,7 +160,7 @@ def evaluate_experiment_a(
             dm_stat = float(dm_result["dm_statistic"])
             dm_p = float(dm_result["p_value"])
 
-        beats_rw = bool(dm_p < 0.05 and mase < 1.0)
+        beats_rw = bool(dm_p < 0.05 and dm_stat < 0)
 
         rows.append(
             {
@@ -183,15 +190,6 @@ def evaluate_experiment_b(
     predictions_dict: dict[str, pd.Series],
     y_test: pd.Series,
 ) -> pd.DataFrame:
-    """Evaluate directional classification metrics for Experiment B.
-
-    Args:
-        predictions_dict: Mapping of model names to prediction series.
-        y_test: Test target series.
-
-    Returns:
-        DataFrame with classification metrics per model.
-    """
     y_test_series = _to_series(y_test)
 
     rows: list[dict[str, Any]] = []
@@ -206,9 +204,12 @@ def evaluate_experiment_b(
 
         scores = np.abs(preds_model.to_numpy(dtype=float))
         interval_width = preds_model.attrs.get("interval_width")
+        
         if interval_width is not None:
-            denom = np.maximum(np.asarray(interval_width, dtype=float) / 2.0, 1e-12)
+            aligned_interval = interval_width.loc[preds_model.index].to_numpy(dtype=float)
+            denom = np.maximum(aligned_interval / 2.0, 1e-12)
             scores = scores / denom
+            
         max_score = float(np.max(scores)) if scores.size else 0.0
         if max_score > 0:
             scores = scores / max_score
@@ -380,12 +381,20 @@ if __name__ == "__main__":
     processed_dir = Path("data/processed")
     predictions = load_all_predictions(processed_dir)
 
-    test_path = processed_dir / "test_returns.parquet"
-    test_df = pd.read_parquet(test_path)
-    if "brent_return" in test_df.columns:
-        y_test_series = test_df["brent_return"]
-    else:
-        y_test_series = test_df.iloc[:, 0]
+    # Визначаємо наявні горизонти прогнозів
+    preds_h1 = {k: v for k, v in predictions.items() if k.endswith("_h1")}
+    preds_h7 = {k: v for k, v in predictions.items() if k.endswith("_h7")}
+
+    def load_test_target(horizon: int) -> pd.Series:
+        """Load the correctly shifted target for evaluation to prevent data leakage."""
+        target_path = processed_dir / f"target_h{horizon}.parquet"
+        if target_path.exists():
+            df = pd.read_parquet(target_path)
+            return df.iloc[:, 0]
+        logger.warning("Target file {path} not found. Falling back to unshifted test_returns.", path=target_path)
+        test_path = processed_dir / "test_returns.parquet"
+        df = pd.read_parquet(test_path)
+        return df["brent_return"] if "brent_return" in df.columns else df.iloc[:, 0]
 
     config_path = Path("configs") / "wfv_config.json"
     w_train = 1000
@@ -406,36 +415,50 @@ if __name__ == "__main__":
 
     y_train_last_window = train_series.tail(w_train)
 
-    preds_h1 = {k: v for k, v in predictions.items() if k.endswith("_h1")}
-    preds_h7 = {k: v for k, v in predictions.items() if k.endswith("_h7")}
-
-    results_a_h1 = evaluate_experiment_a(preds_h1, y_test_series, y_train_last_window)
-    results_a_h7 = evaluate_experiment_a(preds_h7, y_test_series, y_train_last_window)
-    results_b_h1 = evaluate_experiment_b(preds_h1, y_test_series)
-    results_b_h7 = evaluate_experiment_b(preds_h7, y_test_series)
-
     regimes = {
         "post_covid": ("2021-01-01", "2022-02-23"),
         "ukraine_war": ("2022-02-24", "2023-06-30"),
         "normalization": ("2023-07-01", "2026-03-10"),
     }
+    all_results = {}
 
-    regime_results_h1 = regime_analysis(preds_h1, y_test_series, regimes)
-    regime_results_h1["horizon"] = 1
-    regime_results_h7 = regime_analysis(preds_h7, y_test_series, regimes)
-    regime_results_h7["horizon"] = 7
-    regime_results = pd.concat([regime_results_h1, regime_results_h7])
+    def has_baseline(preds_dict: dict) -> bool:
+        return any("random_walk" in k or "randomwalk" in k for k in preds_dict)
 
-    all_results = {
-        "experiment_a_h1": results_a_h1,
-        "experiment_a_h7": results_a_h7,
-        "experiment_b_h1": results_b_h1,
-        "experiment_b_h7": results_b_h7,
-        "regimes": regime_results,
-    }
+    if preds_h1:
+        y_test_h1 = load_test_target(horizon=1)
+        if has_baseline(preds_h1):
+            all_results["experiment_a_h1"] = evaluate_experiment_a(preds_h1, y_test_h1, y_train_last_window)
+        all_results["experiment_b_h1"] = evaluate_experiment_b(preds_h1, y_test_h1)
+        regime_results_h1 = regime_analysis(preds_h1, y_test_h1, regimes)
+        regime_results_h1["horizon"] = 1
+        all_results["regimes_h1"] = regime_results_h1
+
+    if preds_h7:
+        y_test_h7 = load_test_target(horizon=7)
+        if has_baseline(preds_h7):
+            all_results["experiment_a_h7"] = evaluate_experiment_a(preds_h7, y_test_h7, y_train_last_window)
+        all_results["experiment_b_h7"] = evaluate_experiment_b(preds_h7, y_test_h7)
+        regime_results_h7 = regime_analysis(preds_h7, y_test_h7, regimes)
+        regime_results_h7["horizon"] = 7
+        all_results["regimes_h7"] = regime_results_h7
+
+    if "regimes_h1" in all_results and "regimes_h7" in all_results:
+        all_results["regimes"] = pd.concat([all_results["regimes_h1"], all_results["regimes_h7"]])
+    elif "regimes_h1" in all_results:
+        all_results["regimes"] = all_results["regimes_h1"]
+    elif "regimes_h7" in all_results:
+        all_results["regimes"] = all_results["regimes_h7"]
 
     generate_results_tables(all_results, output_dir=processed_dir)
 
-    summary_table = compare_horizons(results_a_h1, results_a_h7)
-    print("\nExperiment A Summary (h1 vs h7)\n")
-    print(summary_table.to_string())
+    if "experiment_a_h1" in all_results and "experiment_a_h7" in all_results:
+        summary_table = compare_horizons(all_results["experiment_a_h1"], all_results["experiment_a_h7"])
+        print("\nExperiment A Summary (h1 vs h7)\n")
+        print(summary_table.to_string())
+    elif "experiment_a_h1" in all_results:
+        print("\nExperiment A Summary (h1 only)\n")
+        print(all_results["experiment_a_h1"].to_string())
+    elif "experiment_a_h7" in all_results:
+        print("\nExperiment A Summary (h7 only)\n")
+        print(all_results["experiment_a_h7"].to_string())

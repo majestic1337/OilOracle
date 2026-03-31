@@ -75,18 +75,19 @@ def calculate_window_mase(
     y_test: Any,
     y_pred: Any,
     m: int = 1,
+    zero_naive: bool = True,
 ) -> float:
-    """Compute mean absolute scaled error (MASE) using a fixed seasonal window.
+    """Compute mean absolute scaled error (MASE).
 
-    We scale errors by the in-sample naive forecast MAE to ensure comparability
-    across regimes with different volatility levels. The seasonal period is
-    explicit so the metric behaves deterministically for academic reporting.
+    For stationary returns (zero_naive=True), the naive baseline is 0.
+    For non-stationary prices (zero_naive=False), the naive baseline is y_{t-m}.
 
     Args:
         y_train: In-sample target values.
         y_test: Out-of-sample target values.
         y_pred: Forecast values for y_test.
         m: Seasonal period for the naive benchmark.
+        zero_naive: Whether to use 0 as the naive forecast (for returns).
 
     Returns:
         MASE value or NaN if the naive MAE is zero.
@@ -101,18 +102,23 @@ def calculate_window_mase(
     if len(test) != len(pred):
         raise ValueError("y_test and y_pred must have the same length")
 
-    if len(train) <= m:
-        logger.warning("Not enough training samples to compute naive MAE for MASE")
-        return float("nan")
+    if zero_naive:
+        if len(train) == 0:
+            logger.warning("Empty training set for MASE")
+            return float("nan")
+        naive_mae = float(np.mean(np.abs(train)))
+    else:
+        if len(train) <= m:
+            logger.warning("Not enough training samples to compute naive MAE for MASE")
+            return float("nan")
+        naive_mae = float(np.mean(np.abs(train[m:] - train[:-m])))
 
-    naive_mae = float(np.mean(np.abs(train[m:] - train[:-m])))
     if naive_mae == 0:
         logger.warning("Naive MAE is zero; MASE undefined")
         return float("nan")
 
     forecast_mae = float(np.mean(np.abs(test - pred)))
     return forecast_mae / naive_mae
-
 
 def calculate_metrics(y_train: Any, y_test: Any, y_pred: Any) -> dict[str, float]:
     """Compute Experiment A metrics (MASE, RMSE, MAE).

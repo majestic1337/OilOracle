@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,8 @@ from loguru import logger
 from sklearn.preprocessing import RobustScaler
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tsa.stattools import grangercausalitytests
+
+ModelFamily = Literal["ml", "dl", "stat"]
 
 
 @dataclass(slots=True)
@@ -25,6 +27,7 @@ class WFVConfig:
     w_step: int = 20
     horizon: int = 1
     strategy: str = "direct"
+    model_family: ModelFamily = "ml"
     window_type: str = "rolling"
     max_lag_order: int = 10
     granger_p_threshold: float = 0.05
@@ -33,11 +36,17 @@ class WFVConfig:
     top_k_shap: int = 15
     random_state: int = 42
     dl_mode: str = "per_fold"
+    dl_recursive: bool = True
+    interval_alpha: float = 0.1
     max_consecutive_failures: int = 3
 
+    def __post_init__(self) -> None:
+        if self.model_family not in {"ml", "dl", "stat"}:
+            raise ValueError("model_family must be one of {'ml', 'dl', 'stat'}")
+
     @property
-    def model_kwargs(self) -> dict:
-        """Словник що передається в конструктор будь-якої DL моделі."""
+    def model_kwargs(self) -> dict[str, int]:
+        """Generic kwargs passed to DL model constructors."""
         return {"horizon": self.horizon}
 
 
@@ -56,20 +65,15 @@ class WFVIteration:
     scaler_center: np.ndarray
     scaler_scale: np.ndarray
     predictions: np.ndarray
+    lower_bounds: np.ndarray
+    upper_bounds: np.ndarray
     actuals: np.ndarray
     fit_time_seconds: float
 
 
-def _ensure_series(y: pd.Series | pd.DataFrame, horizon: int) -> pd.Series | pd.DataFrame:
-    """Ensure y aligns with expected horizon.
 
-    Args:
-        y: Target series or dataframe.
-        horizon: Forecast horizon used for fallback selection.
-
-    Returns:
-        Series for direct strategy or dataframe for MIMO.
-    """
+def _ensure_series(y: pd.Series | pd.DataFrame, horizon: int) -> pd.Series:
+    """Ensure a 1D target series for the configured horizon."""
     if isinstance(y, pd.Series):
         return y
 
@@ -87,6 +91,7 @@ def _ensure_series(y: pd.Series | pd.DataFrame, horizon: int) -> pd.Series | pd.
     return y.iloc[:, 0]
 
 
+
 def _is_incompatible_model_error(error: Exception, horizon: int) -> bool:
     message = str(error).lower()
     if horizon == 1 and "h=1" in message and "incompatible" in message:
@@ -97,21 +102,98 @@ def _is_incompatible_model_error(error: Exception, horizon: int) -> bool:
     return False
 
 
+
+def _to_1d_float(values: Any) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    if array.ndim > 1:
+        if array.shape[1] == 0:
+            return np.array([], dtype=float)
+        array = array[:, 0]
+    if array.ndim > 1:
+        array = array.squeeze()
+    return array
+
+
+
+def _align_prediction_length(values: Any, expected: int, context: str) -> np.ndarray:
+    arr = _to_1d_float(values)
+
+    if expected < 1:
+        raise ValueError("expected must be >= 1")
+
+    if arr.size == expected:
+        return arr
+
+    if arr.size == 0:
+        logger.warning("{ctx}: empty prediction array; filling NaN", ctx=context)
+        return np.full(expected, np.nan, dtype=float)
+
+    if arr.size > expected:
+        logger.warning(
+            "{ctx}: prediction length {got} > expected {exp}; truncating",
+            ctx=context,
+            got=arr.size,
+            exp=expected,
+        )
+        return arr[:expected]
+
+    logger.warning(
+        "{ctx}: prediction length {got} < expected {exp}; padding with last value",
+        ctx=context,
+        got=arr.size,
+        exp=expected,
+    )
+    if arr.size == 1:
+        return np.repeat(arr[0], expected)
+
+    return np.pad(arr, (0, expected - arr.size), mode="edge")
+
+
+
+def _safe_fit_model(
+    model: Any,
+    X_train: pd.DataFrame,
+    y_train: pd.Series | pd.DataFrame,
+    X_val: pd.DataFrame | None,
+    y_val: pd.Series | pd.DataFrame | None,
+) -> None:
+    try:
+        model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+    except TypeError:
+        model.fit(X_train, y_train)
+
+
+
+def _safe_predict_interval(
+    model: Any,
+    X_test: pd.DataFrame,
+    expected: int,
+    alpha: float,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    predict_interval = getattr(model, "predict_interval", None)
+    if not callable(predict_interval):
+        return None, None
+
+    try:
+        lower, upper = predict_interval(X_test, alpha=alpha)
+    except NotImplementedError:
+        return None, None
+    except Exception as exc:  # noqa: BLE001 - optional capability
+        logger.warning("Interval prediction failed: {error}", error=str(exc))
+        return None, None
+
+    lower_arr = _align_prediction_length(lower, expected, context="predict_interval(lower)")
+    upper_arr = _align_prediction_length(upper, expected, context="predict_interval(upper)")
+    return lower_arr, upper_arr
+
+
+
 def _select_features_granger(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     config: WFVConfig,
 ) -> tuple[list[str], dict[str, float]]:
-    """Apply Granger causality filtering.
-
-    Args:
-        X_train: Training feature matrix.
-        y_train: Training target series.
-        config: WFV configuration.
-
-    Returns:
-        Tuple of selected feature names and f-statistics map.
-    """
+    """Apply Granger causality filtering."""
     selected: list[str] = []
     f_stats: dict[str, float] = {}
 
@@ -130,7 +212,7 @@ def _select_features_granger(
             results = grangercausalitytests(
                 combined,
                 maxlag=config.max_lag_order,
-                verbose=False
+                verbose=False,
             )
         except Exception as exc:  # noqa: BLE001 - keep pipeline running
             logger.warning(
@@ -159,26 +241,19 @@ def _select_features_granger(
     return selected, f_stats
 
 
+
 def _select_features_vif(
     X_train: pd.DataFrame,
     config: WFVConfig,
 ) -> list[str]:
-    """Iteratively remove features with high VIF.
-
-    Args:
-        X_train: Training feature matrix.
-        config: WFV configuration.
-
-    Returns:
-        List of features that pass the VIF threshold.
-    """
+    """Iteratively remove features with high VIF."""
     features = list(X_train.columns)
     if len(features) <= 1:
         return features
 
     while True:
         X_values = X_train[features].values
-        vif_values = []
+        vif_values: list[float] = []
         try:
             for idx in range(len(features)):
                 vif_values.append(float(variance_inflation_factor(X_values, idx)))
@@ -199,21 +274,13 @@ def _select_features_vif(
     return features
 
 
+
 def _select_features_correlation(
     X_train: pd.DataFrame,
     f_stats: dict[str, float],
     config: WFVConfig,
 ) -> list[str]:
-    """Remove weakly informative features that are highly correlated with stronger ones.
-
-    Args:
-        X_train: Training feature matrix.
-        f_stats: F-statistics from Granger filtering.
-        config: WFV configuration.
-
-    Returns:
-        List of retained features after correlation pruning.
-    """
+    """Remove weakly informative features highly correlated with stronger ones."""
     features = list(X_train.columns)
     if len(features) <= 1:
         return features
@@ -238,8 +305,8 @@ def _select_features_correlation(
                 to_remove.add(feat)
                 break
 
-    remaining = [feat for feat in features if feat not in to_remove]
-    return remaining
+    return [feat for feat in features if feat not in to_remove]
+
 
 
 def _select_features_shap(
@@ -247,16 +314,7 @@ def _select_features_shap(
     y_train: pd.Series,
     config: WFVConfig,
 ) -> list[str]:
-    """Rank features using LightGBM + SHAP.
-
-    Args:
-        X_train: Training feature matrix.
-        y_train: Training target series.
-        config: WFV configuration.
-
-    Returns:
-        List of top-k features by SHAP importance.
-    """
+    """Rank features using LightGBM + SHAP."""
     try:
         import lightgbm as lgb  # type: ignore
     except Exception as exc:  # noqa: BLE001 - optional dependency
@@ -278,8 +336,6 @@ def _select_features_shap(
     )
 
     try:
-        # Convert to ndarray to keep LightGBM from storing feature names.
-        # This avoids sklearn's feature-name warning when SHAP calls predict.
         X_values = X_train.to_numpy()
         y_values = np.asarray(y_train)
         model.fit(X_values, y_values)
@@ -296,10 +352,8 @@ def _select_features_shap(
 
     importance_series = pd.Series(shap_importance, index=X_train.columns)
     top_k = min(config.top_k_shap, len(importance_series))
-    top_features = (
-        importance_series.sort_values(ascending=False).head(top_k).index.tolist()
-    )
-    return top_features
+    return importance_series.sort_values(ascending=False).head(top_k).index.tolist()
+
 
 
 def select_features_in_fold(
@@ -307,16 +361,7 @@ def select_features_in_fold(
     y_train: pd.Series,
     config: WFVConfig,
 ) -> list[str]:
-    """Select features within a single fold using Granger, VIF, correlation, and SHAP.
-
-    Args:
-        X_train: Training feature matrix.
-        y_train: Training target series.
-        config: WFV configuration.
-
-    Returns:
-        List of selected feature names.
-    """
+    """Select features within a fold using Granger, VIF, correlation, and SHAP."""
     selected, f_stats = _select_features_granger(X_train, y_train, config)
 
     if not selected:
@@ -341,19 +386,12 @@ def select_features_in_fold(
     return shap_features
 
 
+
 def _iter_windows(
     total: int,
     config: WFVConfig,
 ) -> Iterable[tuple[int, int, int, int]]:
-    """Generate rolling/expanding window indices.
-
-    Args:
-        total: Total number of samples.
-        config: WFV configuration.
-
-    Returns:
-        Iterator over (train_start, train_end, val_end, test_end) indices.
-    """
+    """Generate rolling/expanding window indices."""
     if config.window_type not in {"rolling", "expanding"}:
         raise ValueError("window_type must be 'rolling' or 'expanding'")
 
@@ -377,25 +415,99 @@ def _iter_windows(
         fold += 1
 
 
+
+def _extract_target_series(
+    y_data: pd.Series | pd.DataFrame,
+    horizon: int,
+    mimo_target_col: str | None,
+) -> pd.Series:
+    if isinstance(y_data, pd.DataFrame) and mimo_target_col and mimo_target_col in y_data.columns:
+        return y_data[mimo_target_col]
+    return _ensure_series(y_data, horizon)
+
+
+
+def _run_dl_recursive_forecast(
+    model: Any,
+    X_history: pd.DataFrame,
+    y_history: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    interval_alpha: float,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, float]:
+    """Recursive DL inference (step-by-step with observed test updates)."""
+    predictions: list[float] = []
+    lower_values: list[float] = []
+    upper_values: list[float] = []
+    fit_time_total = 0.0
+
+    has_interval = callable(getattr(model, "predict_interval", None))
+
+    history_X = X_history.copy()
+    history_y = y_history.copy()
+
+    for step_idx in range(len(X_test)):
+        X_step = X_test.iloc[[step_idx]]
+
+        start_time = time.perf_counter()
+        _safe_fit_model(model, history_X, history_y, X_val=None, y_val=None)
+        fit_time_total += time.perf_counter() - start_time
+
+        step_pred_raw = model.predict(X_step)
+        step_pred = _align_prediction_length(
+            step_pred_raw,
+            expected=1,
+            context=f"dl_recursive_predict_fold_step_{step_idx}",
+        )[0]
+        predictions.append(float(step_pred))
+
+        if has_interval:
+            lower_step, upper_step = _safe_predict_interval(
+                model,
+                X_step,
+                expected=1,
+                alpha=interval_alpha,
+            )
+            lower_values.append(float(lower_step[0]) if lower_step is not None else np.nan)
+            upper_values.append(float(upper_step[0]) if upper_step is not None else np.nan)
+
+        actual_value = float(y_test.iloc[step_idx])
+        history_X = pd.concat([history_X, X_step], axis=0)
+        history_y = pd.concat(
+            [
+                history_y,
+                pd.Series([actual_value], index=X_step.index, name=history_y.name),
+            ],
+            axis=0,
+        )
+
+    preds_array = np.asarray(predictions, dtype=float)
+
+    if has_interval:
+        lower_arr = np.asarray(lower_values, dtype=float)
+        upper_arr = np.asarray(upper_values, dtype=float)
+        if np.isnan(lower_arr).all() or np.isnan(upper_arr).all():
+            return preds_array, None, None, fit_time_total
+        return preds_array, lower_arr, upper_arr, fit_time_total
+
+    return preds_array, None, None, fit_time_total
+
+
 def run_wfv(
     X: pd.DataFrame,
     y: pd.Series | pd.DataFrame,
     model: Any,
     config: WFVConfig,
-) -> tuple[list[WFVIteration], pd.Series]:
-    """Run walk-forward validation loop.
+) -> tuple[list[WFVIteration], pd.DataFrame]:
+    """Run walk-forward validation loop."""
+    import time
+    from sklearn.base import clone
+    from sklearn.preprocessing import RobustScaler
+    from tqdm import tqdm
 
-    Args:
-        X: Feature matrix.
-        y: Target series or dataframe.
-        model: Model implementing fit(X, y, X_val, y_val) and predict(X).
-        config: WFV configuration.
-
-    Returns:
-        Tuple of WFVIteration list and prediction series.
-    """
     y_model: pd.Series | pd.DataFrame
     mimo_target_col: str | None = None
+
     if config.strategy == "mimo" and isinstance(y, pd.DataFrame):
         y_model = y
         for candidate in (f"h{config.horizon}", f"target_h{config.horizon}"):
@@ -413,194 +525,209 @@ def run_wfv(
         y_model = _ensure_series(y, config.horizon)
 
     common_index = X.index.intersection(y_model.index)
-    X = X.loc[common_index]
-    y_model = y_model.loc[common_index]
+    X = X.loc[common_index].sort_index()
+    y_model = y_model.loc[common_index].sort_index()
 
     iterations: list[WFVIteration] = []
-    predictions_list: list[pd.Series] = []
+    predictions_list: list[pd.DataFrame] = []
+
+    pred_col_name = f"pred_h{config.horizon}"
+    
+    # Defensive filtering for stat/dl features
+    forbidden_cols = {"unique_id", "ds", "y"}
+    static_features = [col for col in X.columns if col not in forbidden_cols]
+    
     skip_model = False
-    skip_reason = ""
     consecutive_failures = 0
 
-    global_trained = False
-    global_selected_features: list[str] | None = None
-    global_scaler: RobustScaler | None = None
+    windows = list(_iter_windows(len(X), config))
+    progress_bar = tqdm(
+        windows, 
+        desc=f"WFV [{config.model_family.upper()} | h={config.horizon}]", 
+        unit="fold",
+        dynamic_ncols=True
+    )
 
-    for fold_idx, (train_start, train_end, val_end, test_end) in enumerate(
-        _iter_windows(len(X), config)
-    ):
-        train_slice = slice(train_start, train_end)
-        val_slice = slice(train_end, val_end)
-        test_slice = slice(val_end, test_end)
+    for fold_idx, (train_start, train_end, val_end, test_end) in enumerate(progress_bar):
+        try:
+            embargo_steps = config.horizon - 1
+            test_start_embargo = val_end + embargo_steps
+            
+            if test_start_embargo >= test_end:
+                logger.warning(
+                    "Fold {fold} skipped: embargo overlap (test_start {ts} >= test_end {te})", 
+                    fold=fold_idx, ts=test_start_embargo, te=test_end
+                )
+                continue
 
-        X_train = X.iloc[train_slice]
-        X_val = X.iloc[val_slice]
-        X_test = X.iloc[test_slice]
+            # Safe initialization via sklearn clone
+            fold_model = clone(model)
 
-        if config.dl_mode == "global_train" and global_trained and global_scaler is not None and global_selected_features is not None:
-            # Reuse globally trained artifacts for testing
-            scaler = global_scaler
-            selected_features = global_selected_features
-            
-            X_test_scaled = pd.DataFrame(
-                scaler.transform(X_test),
-                index=X_test.index,
-                columns=X_test.columns,
-            )
-            X_test_sel = X_test_scaled[selected_features]
-            
-            # Create dummy arrays since we skip training
-            X_train_sel = pd.DataFrame()
-            X_val_sel = pd.DataFrame()
-            
-            # Still need actuals for audit
-            if isinstance(y_test, pd.DataFrame) and mimo_target_col is not None:
-                actuals_series = y_test[mimo_target_col]
-            else:
-                actuals_series = _ensure_series(y_test, config.horizon)
-            actuals_array = np.asarray(actuals_series).astype(float)
-        else:
-            y_train = y_model.iloc[train_slice]
-            y_val = y_model.iloc[val_slice]
-            y_test = y_model.iloc[test_slice]
+            train_slice = slice(train_start, train_end)
+            val_slice = slice(train_end, val_end)
+            test_slice = slice(test_start_embargo, test_end)
+
+            X_train = X.iloc[train_slice]
+            X_val = X.iloc[val_slice]
+            X_test = X.iloc[test_slice]
+
+            y_train_raw = y_model.iloc[train_slice]
+            y_val_raw = y_model.iloc[val_slice]
+            y_test_raw = y_model.iloc[test_slice]
+
+            y_train_target = _extract_target_series(y_train_raw, config.horizon, mimo_target_col)
+            y_val_target = _extract_target_series(y_val_raw, config.horizon, mimo_target_col)
+            y_test_target = _extract_target_series(y_test_raw, config.horizon, mimo_target_col)
+
+            features_to_scale = [col for col in X_train.columns if col not in forbidden_cols]
 
             scaler = RobustScaler()
-            X_train_scaled = pd.DataFrame(
-                scaler.fit_transform(X_train),
-                index=X_train.index,
-                columns=X_train.columns,
-            )
-            X_val_scaled = pd.DataFrame(
-                scaler.transform(X_val),
-                index=X_val.index,
-                columns=X_val.columns,
-            )
-            X_test_scaled = pd.DataFrame(
-                scaler.transform(X_test),
-                index=X_test.index,
-                columns=X_test.columns,
-            )
+            X_train_scaled = X_train.copy()
+            X_val_scaled = X_val.copy()
+            X_test_scaled = X_test.copy()
 
-            if isinstance(y_train, pd.DataFrame) and mimo_target_col is not None:
-                selection_target = y_train[mimo_target_col]
+            if features_to_scale:
+                X_train_scaled[features_to_scale] = scaler.fit_transform(X_train[features_to_scale])
+                X_val_scaled[features_to_scale] = scaler.transform(X_val[features_to_scale])
+                X_test_scaled[features_to_scale] = scaler.transform(X_test[features_to_scale])
             else:
-                selection_target = _ensure_series(y_train, config.horizon)
-            selected_features = select_features_in_fold(X_train_scaled, selection_target, config)
-            if not selected_features:
-                logger.warning("No features selected in fold {fold}; using all features", fold=fold_idx)
-                selected_features = list(X_train_scaled.columns)
+                scaler.center_ = np.array([])
+                scaler.scale_ = np.array([])
+
+            if config.model_family == "ml":
+                selected_features = select_features_in_fold(
+                    X_train_scaled,
+                    y_train_target,
+                    config,
+                )
+                if not selected_features:
+                    logger.warning(
+                        "No features selected in fold {fold}; using all features",
+                        fold=fold_idx,
+                    )
+                    selected_features = list(X_train_scaled.columns)
+            else:
+                selected_features = static_features
 
             X_train_sel = X_train_scaled[selected_features]
             X_val_sel = X_val_scaled[selected_features]
             X_test_sel = X_test_scaled[selected_features]
 
-            if isinstance(y_test, pd.DataFrame) and mimo_target_col is not None:
-                actuals_series = y_test[mimo_target_col]
-            else:
-                actuals_series = _ensure_series(y_test, config.horizon)
-            actuals_array = np.asarray(actuals_series).astype(float)
+            # Strict 1D target enforcing
+            y_train_fit = y_train_target
+            y_val_fit = y_val_target
 
-        fit_time = 0.0
-        preds_array: np.ndarray = np.array([])
+            fit_time = 0.0
+            lower_array: np.ndarray | None = None
+            upper_array: np.ndarray | None = None
 
-        try:
-            start_time = time.perf_counter()
-            if config.dl_mode == "global_train" and global_trained:
-                pass  # Skip retraining
+            if config.model_family == "dl" and config.dl_recursive:
+                X_history = pd.concat([X_train_sel, X_val_sel], axis=0).sort_index()
+                y_history = pd.concat([y_train_target, y_val_target], axis=0).sort_index()
+                preds_array, lower_array, upper_array, fit_time = _run_dl_recursive_forecast(
+                    model=fold_model,
+                    X_history=X_history,
+                    y_history=y_history,
+                    X_test=X_test_sel,
+                    y_test=y_test_target,
+                    interval_alpha=config.interval_alpha,
+                )
             else:
-                try:
-                    model.fit(X_train_sel, y_train, X_val=X_val_sel, y_val=y_val)
-                except TypeError:
-                    model.fit(X_train_sel, y_train)
+                start_time = time.perf_counter()
+                _safe_fit_model(
+                    fold_model,
+                    X_train_sel,
+                    y_train_fit,
+                    X_val=X_val_sel,
+                    y_val=y_val_fit,
+                )
                 fit_time = time.perf_counter() - start_time
-                
-                if config.dl_mode == "global_train":
-                    global_trained = True
-                    global_scaler = scaler
-                    global_selected_features = selected_features
 
-            preds = model.predict(X_test_sel)
-            preds_array = np.asarray(preds)
-            if preds_array.ndim > 1:
-                if isinstance(y_model, pd.DataFrame) and mimo_target_col is not None:
-                    col_idx = list(y_model.columns).index(mimo_target_col)
-                    preds_array = preds_array[:, col_idx]
-                else:
-                    preds_array = preds_array[:, 0]
-            preds_array = preds_array.astype(float)
+                preds_raw = fold_model.predict(X_test_sel)
+                preds_array = _align_prediction_length(
+                    preds_raw,
+                    expected=len(X_test_sel),
+                    context=f"predict_fold_{fold_idx}",
+                )
+                lower_array, upper_array = _safe_predict_interval(
+                    model=fold_model,
+                    X_test=X_test_sel,
+                    expected=len(X_test_sel),
+                    alpha=config.interval_alpha,
+                )
 
-            predictions_list.append(pd.Series(preds_array, index=X_test_sel.index))
+            actuals_array = _to_1d_float(y_test_target)
+
+            fold_predictions = pd.DataFrame(
+                {pred_col_name: preds_array},
+                index=X_test_sel.index,
+            )
+            if lower_array is not None and upper_array is not None:
+                fold_predictions["lower"] = lower_array
+                fold_predictions["upper"] = upper_array
+
+            predictions_list.append(fold_predictions)
             consecutive_failures = 0
-            
-        except Exception as exc:  # noqa: BLE001 - keep pipeline running
+
+            iterations.append(
+                WFVIteration(
+                    fold_idx=fold_idx,
+                    train_start=X_train.index[0],
+                    train_end=X_train.index[-1],
+                    test_start=X_test.index[0],
+                    test_end=X_test.index[-1],
+                    selected_features=selected_features,
+                    n_features_input=X_train.shape[1],
+                    n_features_selected=len(selected_features),
+                    scaler_center=scaler.center_.copy(),
+                    scaler_scale=scaler.scale_.copy(),
+                    predictions=preds_array,
+                    lower_bounds=lower_array if lower_array is not None else np.array([]),
+                    upper_bounds=upper_array if upper_array is not None else np.array([]),
+                    actuals=actuals_array,
+                    fit_time_seconds=fit_time,
+                )
+            )
+
+        except Exception as exc:  # noqa: BLE001
             consecutive_failures += 1
+            logger.exception(
+                "Fold {fold} failed (model_family={family}): {error}",
+                fold=fold_idx,
+                family=config.model_family,
+                error=str(exc),
+            )
+
             if _is_incompatible_model_error(exc, config.horizon):
                 skip_model = True
-                skip_reason = str(exc)
-                logger.warning(
-                    "Skipping model after incompatibility on fold {fold}: {error}",
-                    fold=fold_idx,
-                    error=skip_reason,
-                )
-                break
-                
-            logger.error("Model failed on fold {fold}: {error}", fold=fold_idx, error=str(exc))
-            
-            if consecutive_failures >= config.max_consecutive_failures:
-                skip_model = True
-                skip_reason = f"Model failed {config.max_consecutive_failures} consecutive times. Aborting WFV."
-                logger.error(skip_reason)
+                logger.warning("Stopping WFV for model due to incompatibility at fold {fold}", fold=fold_idx)
                 break
 
-        iterations.append(
-            WFVIteration(
-                fold_idx=fold_idx,
-                train_start=X_train.index[0],
-                train_end=X_train.index[-1],
-                test_start=X_test.index[0],
-                test_end=X_test.index[-1],
-                selected_features=selected_features,
-                n_features_input=X_train.shape[1],
-                n_features_selected=len(selected_features),
-                scaler_center=scaler.center_.copy(),
-                scaler_scale=scaler.scale_.copy(),
-                predictions=preds_array,
-                actuals=actuals_array,
-                fit_time_seconds=fit_time,
-            )
-        )
+            if consecutive_failures >= config.max_consecutive_failures:
+                skip_model = True
+                logger.error("Stopping WFV after {n} consecutive fold failures", n=config.max_consecutive_failures)
+                break
+
+            continue
 
     if skip_model:
         iterations = []
         predictions_list = []
 
     if predictions_list:
-        predictions_series = pd.concat(predictions_list).sort_index()
+        predictions_df = pd.concat(predictions_list, axis=0).sort_index()
     else:
-        predictions_series = pd.Series(dtype=float)
+        predictions_df = pd.DataFrame(columns=[pred_col_name])
 
-    predictions_series.name = f"pred_h{config.horizon}"
-    predictions_series.attrs["horizon"] = config.horizon
-
-    return iterations, predictions_series
-
+    predictions_df.attrs["horizon"] = config.horizon
+    return iterations, predictions_df
 
 def load_cached_results(
     model_name: str,
     horizon: int,
     output_dir: str | Path,
-) -> tuple[list[WFVIteration], pd.Series] | None:
-    """Load cached predictions/audit if present.
-
-    Args:
-        model_name: Name of the model used.
-        horizon: Forecast horizon.
-        output_dir: Directory for output artifacts.
-
-    Returns:
-        Tuple of empty iterations list and predictions series if cache exists,
-        otherwise None.
-    """
+) -> tuple[list[WFVIteration], pd.DataFrame] | None:
+    """Load cached predictions/audit if present."""
     output_path = Path(output_dir)
     predictions_path = output_path / f"predictions_{model_name}_{horizon}.parquet"
     audit_path = output_path / f"audit_{model_name}_{horizon}.json"
@@ -610,16 +737,6 @@ def load_cached_results(
 
     try:
         predictions_df = pd.read_parquet(predictions_path)
-        if predictions_df.empty:
-            logger.warning(
-                "Cached predictions empty for {model} horizon {h}; rerunning WFV",
-                model=model_name,
-                h=horizon,
-            )
-            return None
-        predictions = predictions_df.iloc[:, 0].copy()
-        predictions.name = predictions_df.columns[0]
-        predictions.attrs["horizon"] = horizon
     except Exception as exc:  # noqa: BLE001 - fallback to recompute
         logger.warning(
             "Failed to load cached predictions for {model} horizon {h}: {error}",
@@ -629,39 +746,63 @@ def load_cached_results(
         )
         return None
 
+    if predictions_df.empty:
+        logger.warning(
+            "Cached predictions empty for {model} horizon {h}; rerunning WFV",
+            model=model_name,
+            h=horizon,
+        )
+        return None
+
+    if not isinstance(predictions_df.index, pd.DatetimeIndex):
+        predictions_df = predictions_df.copy()
+        predictions_df.index = pd.to_datetime(predictions_df.index)
+
+    predictions_df = predictions_df.sort_index()
+    predictions_df.attrs["horizon"] = horizon
+
     logger.info(
         "Using cached WFV results for {model} horizon {h}; skipping training",
         model=model_name,
         h=horizon,
     )
-    return [], predictions
+    return [], predictions_df
+
 
 
 def save_wfv_results(
     iterations: list[WFVIteration],
-    predictions: pd.Series,
+    predictions: pd.Series | pd.DataFrame,
     model_name: str,
     output_dir: str | Path,
 ) -> None:
-    """Save predictions and audit logs.
-
-    Args:
-        iterations: List of WFV iterations.
-        predictions: Predictions series with datetime index.
-        model_name: Name of the model used.
-        output_dir: Directory for output artifacts.
-
-    Returns:
-        None
-    """
+    """Save predictions and audit logs."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    horizon = predictions.attrs.get("horizon", "unknown")
-    predictions_path = output_path / f"predictions_{model_name}_{horizon}.parquet"
-    predictions.to_frame(name=predictions.name).to_parquet(predictions_path)
+    if isinstance(predictions, pd.Series):
+        predictions_df = predictions.to_frame(name=predictions.name or "prediction")
+    else:
+        predictions_df = predictions.copy()
 
-    audit_payload = []
+    horizon_attr = predictions_df.attrs.get("horizon")
+    if horizon_attr is None:
+        horizon_attr = predictions.attrs.get("horizon") if hasattr(predictions, "attrs") else None
+
+    if horizon_attr is None:
+        pred_column = next((c for c in predictions_df.columns if c.startswith("pred_h")), "")
+        if pred_column.startswith("pred_h"):
+            try:
+                horizon_attr = int(pred_column.replace("pred_h", ""))
+            except ValueError:
+                horizon_attr = "unknown"
+        else:
+            horizon_attr = "unknown"
+
+    predictions_path = output_path / f"predictions_{model_name}_{horizon_attr}.parquet"
+    predictions_df.to_parquet(predictions_path)
+
+    audit_payload: list[dict[str, Any]] = []
     for iteration in iterations:
         audit_payload.append(
             {
@@ -676,19 +817,18 @@ def save_wfv_results(
                 "scaler_center": iteration.scaler_center.tolist(),
                 "scaler_scale": iteration.scaler_scale.tolist(),
                 "predictions": iteration.predictions.tolist(),
+                "lower_bounds": iteration.lower_bounds.tolist(),
+                "upper_bounds": iteration.upper_bounds.tolist(),
                 "actuals": iteration.actuals.tolist(),
                 "fit_time_seconds": iteration.fit_time_seconds,
             }
         )
 
-    audit_path = output_path / f"audit_{model_name}_{horizon}.json"
+    audit_path = output_path / f"audit_{model_name}_{horizon_attr}.json"
     with audit_path.open("w", encoding="utf-8") as handle:
         json.dump(audit_payload, handle, indent=2)
 
-    if iterations:
-        avg_features = float(np.mean([it.n_features_selected for it in iterations]))
-    else:
-        avg_features = 0.0
+    avg_features = float(np.mean([it.n_features_selected for it in iterations])) if iterations else 0.0
     total_time = float(np.sum([it.fit_time_seconds for it in iterations])) if iterations else 0.0
 
     logger.info("Saved predictions to {path}", path=predictions_path)
@@ -705,14 +845,21 @@ if __name__ == "__main__":
     from sklearn.ensemble import RandomForestRegressor
 
     processed_dir = Path("data/processed")
-    X = pd.read_parquet(processed_dir / "feature_matrix.parquet")
+
+    X_path = processed_dir / "feature_matrix_ml.parquet"
+    if not X_path.exists():
+        X_path = processed_dir / "feature_matrix.parquet"
+    X = pd.read_parquet(X_path)
 
     config_path = Path("configs") / "lag_order_config.json"
     config_data: dict[str, Any] = {}
     if config_path.exists():
         config_data = json.loads(config_path.read_text(encoding="utf-8"))
 
-    config = WFVConfig(max_lag_order=int(config_data.get("max_lag_order", 10)))
+    config = WFVConfig(
+        model_family="ml",
+        max_lag_order=int(config_data.get("max_lag_order", 10)),
+    )
 
     target_path = processed_dir / f"target_h{config.horizon}.parquet"
     y = pd.read_parquet(target_path)
@@ -735,5 +882,10 @@ if __name__ == "__main__":
 
     model = _RFWrapper(RandomForestRegressor(n_estimators=200, random_state=config.random_state))
 
-    iterations, predictions = run_wfv(X, y, model, config)
-    save_wfv_results(iterations, predictions, model_name="random_forest", output_dir=processed_dir)
+    iterations, predictions_df = run_wfv(X, y, model, config)
+    save_wfv_results(
+        iterations,
+        predictions_df,
+        model_name="random_forest",
+        output_dir=processed_dir,
+    )

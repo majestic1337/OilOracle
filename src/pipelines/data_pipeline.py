@@ -17,6 +17,8 @@ from statsmodels.tools.sm_exceptions import InterpolationWarning
 from statsmodels.tsa.stattools import adfuller, kpss
 
 DB_URL = "postgresql://admin:adminpassword@localhost:5432/brentprices_data"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 TABLE_MAP: dict[str, str] = {
     "brent": "brent_prices",
@@ -79,28 +81,37 @@ def load_raw_data(engine: Engine) -> pd.DataFrame:
 
 
 def align_series(df: pd.DataFrame) -> pd.DataFrame:
-    """Align asset series using business days and intersection filtering.
+    """Align series to the target Brent calendar and fill exogenous gaps.
 
     Args:
         df: Wide-format DataFrame with raw prices.
 
     Returns:
-        Aligned DataFrame restricted to weekdays with no missing values.
+        DataFrame reindexed to Brent's non-null calendar, with exogenous
+        columns forward-filled up to 3 business steps.
     """
+    if "brent" not in df.columns:
+        raise ValueError("align_series requires a 'brent' column")
+
     if not isinstance(df.index, pd.DatetimeIndex):
         df = df.copy()
         df.index = pd.to_datetime(df.index)
 
-    weekdays_df = df[df.index.dayofweek < 5]
-    aligned_df = weekdays_df.dropna(how="any")
+    weekdays_df = df[df.index.dayofweek < 5].sort_index()
+    brent_index = weekdays_df["brent"].dropna().index
+    if brent_index.empty:
+        raise ValueError("Brent index is empty after dropping NaN values")
 
-    dropped_dates = df.index.difference(aligned_df.index)
-    dropped_list = [date.strftime("%Y-%m-%d") for date in dropped_dates]
-    logger.info("Dropped {count} dates during alignment", count=len(dropped_list))
-    logger.info("Dropped dates: {dates}", dates=dropped_list)
-    if not dropped_dates.empty:
-        missing_by_asset = df.loc[dropped_dates].isna().sum().to_dict()
-        logger.info("Missing counts by asset for dropped dates: {counts}", counts=missing_by_asset)
+    aligned_df = weekdays_df.reindex(brent_index)
+
+    exogenous_columns = [col for col in ("wti", "dxy", "gold") if col in aligned_df.columns]
+    for column in exogenous_columns:
+        aligned_df[column] = aligned_df[column].ffill(limit=3)
+
+    logger.info("Aligned calendar length (Brent-anchored): {n}", n=len(aligned_df))
+    if exogenous_columns:
+        remaining_nans = aligned_df[exogenous_columns].isna().sum().to_dict()
+        logger.info("Remaining NaN counts in exogenous columns: {counts}", counts=remaining_nans)
 
     return aligned_df
 
@@ -224,6 +235,8 @@ def save_processed_data(
         None
     """
     output_path = Path(output_dir)
+    if not output_path.is_absolute():
+        output_path = PROJECT_ROOT / output_path
     output_path.mkdir(parents=True, exist_ok=True)
 
     for split_name, split_df in splits.items():
@@ -246,7 +259,7 @@ if __name__ == "__main__":
     diagnostics = run_stationarity_diagnostics(returns_df)
     splits = create_train_val_test_split(returns_df)
 
-    save_processed_data(splits, diagnostics, output_dir="data/processed")
+    save_processed_data(splits, diagnostics, output_dir=DEFAULT_PROCESSED_DIR)
 
     for split_name, split_df in splits.items():
         summary = split_df.describe().T
