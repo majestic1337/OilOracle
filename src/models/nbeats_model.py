@@ -2,30 +2,26 @@
 
 from __future__ import annotations
 
+import logging # Додано для приглушення логів Lightning
 from loguru import logger
 
 from src.models.dl_wrapper import DeepLearningForecasterWrapper
 
+# Приглушуємо системні повідомлення PyTorch Lightning
+logging.getLogger("pytorch_lightning.utilities.rank_zero").setLevel(logging.ERROR)
+logging.getLogger("pytorch_lightning.accelerators.cuda").setLevel(logging.ERROR)
+
 
 class NBEATSForecaster(DeepLearningForecasterWrapper):
-    """NBEATS forecasting model (Oreshkin et al., 2019).
+    """NBEATS forecasting model (Oreshkin et al., 2019)."""
 
-    The architecture won the M4 competition by combining trend and seasonality
-    basis expansions in a fully-connected stack. On stationary log-returns the
-    seasonality component is less pronounced, but the trend block still provides
-    a strong autoregressive baseline. We choose NBEATS over LSTM to avoid
-    vanishing-gradient issues in long sequences while retaining interpretability.
-    Note: stack_types are adapted automatically based on horizon; no manual
-    tuning needed.
-    """
-
-    def __init__(self, horizon: int, input_size: int = None) -> None:
+    def __init__(self, horizon: int, input_size: int | None = None) -> None:
         if input_size is None:
             input_size = 5 * horizon if horizon > 1 else 10
 
         try:
             from neuralforecast.models import NBEATS
-        except Exception as exc:  # noqa: BLE001 - optional dependency
+        except Exception as exc:  # noqa: BLE001
             raise ImportError("neuralforecast is required for NBEATSForecaster") from exc
 
         if horizon == 1:
@@ -42,26 +38,22 @@ class NBEATSForecaster(DeepLearningForecasterWrapper):
             n_blocks = [3, 3]
             mlp_units = [[512, 512], [512, 512]]
 
-        params = dict(
-            h=horizon,
-            input_size=input_size,
+        model_kwargs = dict(
             stack_types=stack_types,
             n_blocks=n_blocks,
             mlp_units=mlp_units,
             max_steps=300,
             learning_rate=1e-3,
-            val_check_steps=50,
-            early_stop_patience_steps=10,
+            early_stop_patience_steps=-1,
             random_seed=42,
             accelerator="cpu",
+            enable_progress_bar=False,   # Вимикає ProgressBar Lightning для кожного фолду
+            enable_model_summary=False,  # Вимикає таблицю параметрів для кожного фолду
         )
-        model_kwargs = {k: v for k, v in params.items() if k not in {"h", "input_size"}}
 
-        self.model_instance = NBEATS(**params)
         super().__init__(
             model_class=NBEATS,
             horizon=horizon,
             input_size=input_size,
             **model_kwargs,
         )
-        self.model_instance = NBEATS(**params)
