@@ -44,12 +44,15 @@ class XGBoostForecaster(BaseForecaster):
     def _build_model(self, quantile: float) -> Any:
         try:
             from xgboost import XGBRegressor
-        except Exception as exc:  # noqa: BLE001
+        except ImportError as exc:
             raise ImportError("xgboost is required") from exc
 
+        # Використання MSE для медіани (q50) для стабілізації в умовах шуму
+        objective = "reg:squarederror" if quantile == 0.5 else "reg:quantileerror"
+        
         return XGBRegressor(
-            objective="reg:quantileerror",
-            quantile_alpha=quantile,
+            objective=objective,
+            quantile_alpha=quantile if objective == "reg:quantileerror" else None,
             n_estimators=200,         
             learning_rate=0.05,       
             max_depth=2,              
@@ -57,7 +60,7 @@ class XGBoostForecaster(BaseForecaster):
             colsample_bytree=0.8,
             reg_alpha=0.5,            
             reg_lambda=1.0,           
-            early_stopping_rounds=20, # Перенесено в конструктор
+            early_stopping_rounds=20,
             random_state=self.random_state,
         )
 
@@ -68,7 +71,7 @@ class XGBoostForecaster(BaseForecaster):
         X_val: Any | None = None,
         y_val: Any | None = None,
     ) -> "XGBoostForecaster":
-        self._logger.info("Fitting XGBoost quantile models (q10/q50/q90)")
+        self.feature_names_ = X_train.columns.tolist() if hasattr(X_train, "columns") else None
         X_arr = _as_2d_array(X_train)
         y_arr = _as_1d_array(y_train)
 
@@ -86,7 +89,6 @@ class XGBoostForecaster(BaseForecaster):
 
         eval_set = [(X_v, y_v)]
         
-        # Видалено early_stopping_rounds з методу fit
         self.model_q10.fit(X_t, y_t, eval_set=eval_set, verbose=False)
         self.model_q50.fit(X_t, y_t, eval_set=eval_set, verbose=False)
         self.model_q90.fit(X_t, y_t, eval_set=eval_set, verbose=False)
@@ -96,39 +98,43 @@ class XGBoostForecaster(BaseForecaster):
     def predict(self, X: Any) -> np.ndarray:
         if self.model_q50 is None:
             raise ValueError("XGBoostForecaster must be fitted before prediction")
-        return self.model_q50.predict(_as_2d_array(X)).astype(float)
+            
+        X_input = X
+        if not isinstance(X_input, pd.DataFrame) and self.feature_names_:
+            X_input = pd.DataFrame(X_input, columns=self.feature_names_)
+            
+        return self.model_q50.predict(_as_2d_array(X_input)).astype(float)
 
     def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
         if self.model_q10 is None or self.model_q90 is None:
             raise ValueError("XGBoostForecaster must be fitted before interval prediction")
-        lower = self.model_q10.predict(_as_2d_array(X)).astype(float)
-        upper = self.model_q90.predict(_as_2d_array(X)).astype(float)
+            
+        X_arr = _as_2d_array(X)
+        lower = self.model_q10.predict(X_arr).astype(float)
+        upper = self.model_q90.predict(X_arr).astype(float)
         return lower, upper
 
 class LightGBMForecaster(BaseForecaster):
-    """Quantile-regression LightGBM forecaster.
-
-    We train independent quantile estimators for 0.1/0.5/0.9 to avoid mixing
-    quantile objectives in a single model; this keeps calibration explicit and
-    allows later hyperparameter specialization per quantile.
-    """
-
     def __init__(self, random_state: int = 42) -> None:
         self.random_state = random_state
         self._logger = logger.bind(model=self.__class__.__name__)
         self.model_q10: Any | None = None
         self.model_q50: Any | None = None
         self.model_q90: Any | None = None
+        self.feature_names_: list[str] | None = None
 
     def _build_model(self, quantile: float) -> Any:
         try:
             from lightgbm import LGBMRegressor
-        except Exception as exc:  # noqa: BLE001 - optional dependency
-            raise ImportError("lightgbm is required for LightGBMForecaster") from exc
+        except ImportError as exc:
+            raise ImportError("lightgbm is required") from exc
 
+        # Використання MSE для медіани (q50) для стабілізації в умовах шуму
+        objective = "regression" if quantile == 0.5 else "quantile"
+        
         return LGBMRegressor(
-            objective="quantile",
-            alpha=quantile,
+            objective=objective,
+            alpha=quantile if objective == "quantile" else None,
             n_estimators=1000,
             learning_rate=0.01,
             num_leaves=31,
@@ -145,8 +151,6 @@ class LightGBMForecaster(BaseForecaster):
         X_val: Any | None = None,
         y_val: Any | None = None,
     ) -> "LightGBMForecaster":
-        """Fit three independent quantile models with optional early stopping."""
-        self._logger.info("Fitting LightGBM quantile models (q10/q50/q90)")
         self.feature_names_ = X_train.columns.tolist() if hasattr(X_train, "columns") else None
         X_arr = _as_2d_array(X_train)
         y_arr = _as_1d_array(y_train)
@@ -159,45 +163,40 @@ class LightGBMForecaster(BaseForecaster):
         self.model_q90.fit(X_arr, y_arr)
 
         if X_val is not None and y_val is not None:
-            X_val_arr = _as_2d_array(X_val)
-            y_val_arr = _as_1d_array(y_val)
+            X_v, y_v = _as_2d_array(X_val), _as_1d_array(y_val)
             try:
                 from lightgbm import early_stopping, log_evaluation
-            except Exception as exc:  # noqa: BLE001 - optional dependency
-                self._logger.warning("LightGBM callbacks unavailable: {error}", error=str(exc))
-                self.model_q50.fit(X_arr, y_arr)
-            else:
                 self.model_q50.fit(
                     X_arr,
                     y_arr,
-                    eval_set=[(X_val_arr, y_val_arr)],
+                    eval_set=[(X_v, y_v)],
                     callbacks=[early_stopping(50), log_evaluation(0)],
                 )
+            except (ImportError, Exception):
+                self.model_q50.fit(X_arr, y_arr)
         else:
             self.model_q50.fit(X_arr, y_arr)
 
         return self
 
     def predict(self, X: Any) -> np.ndarray:
-        """Return the median (q50) forecast."""
         if self.model_q50 is None:
-            raise ValueError("LightGBMForecaster must be fitted before prediction")
-        X_input: Any = X
-        if not isinstance(X_input, pd.DataFrame):
-            if self.feature_names_ is not None:
-                X_input = pd.DataFrame(X_input, columns=self.feature_names_)
-            else:
-                X_input = _as_2d_array(X_input)
+            raise ValueError("Model not fitted")
+        
+        X_input = X
+        if not isinstance(X_input, pd.DataFrame) and self.feature_names_:
+            X_input = pd.DataFrame(X_input, columns=self.feature_names_)
+        
         return self.model_q50.predict(X_input).astype(float)
 
     def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
-        """Return the 10th and 90th percentile forecasts as an interval."""
         if self.model_q10 is None or self.model_q90 is None:
-            raise ValueError("LightGBMForecaster must be fitted before interval prediction")
-        lower = self.model_q10.predict(_as_2d_array(X)).astype(float)
-        upper = self.model_q90.predict(_as_2d_array(X)).astype(float)
+            raise ValueError("Interval models not fitted")
+            
+        X_arr = _as_2d_array(X)
+        lower = self.model_q10.predict(X_arr).astype(float)
+        upper = self.model_q90.predict(X_arr).astype(float)
         return lower, upper
-
 
 class AdaptiveConformalWrapper(BaseForecaster):
     """Adaptive conformal inference wrapper for point-forecast models.

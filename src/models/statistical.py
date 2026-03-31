@@ -56,6 +56,8 @@ class RandomWalkModel(BaseForecaster):
         if series.size == 0:
             raise ValueError("y_train is empty; cannot fit RandomWalkModel")
 
+        self._expected_return = float(np.mean(series))
+        
         window = min(self.window, len(series))
         if window < 2:
             self._logger.warning("Insufficient samples to estimate rolling std")
@@ -161,7 +163,7 @@ class ARIMAGARCHModel(BaseForecaster):
         If the ARIMA or GARCH fails to converge, we degrade gracefully to a
         random-walk forecast while preserving the model interface.
         """
-        series = _first_column_series(X_train)
+        series = np.asarray(y_train, dtype=float).squeeze()
         if series.size == 0:
             raise ValueError("X_train is empty; cannot fit ARIMAGARCHModel")
 

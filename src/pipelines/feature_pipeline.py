@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
 from loguru import logger
@@ -19,6 +19,7 @@ REQUIRED_RETURN_COLUMNS: tuple[str, ...] = (
     "gold_return",
 )
 LAG_AIC_CACHE: dict[int, float] = {}
+DEFAULT_HORIZONS: tuple[int, ...] = (1, 3, 5, 7)
 
 
 def _validate_returns_columns(df: pd.DataFrame) -> None:
@@ -54,7 +55,7 @@ def _compute_aic_by_lag(train_df: pd.DataFrame, max_search: int) -> dict[int, fl
 
 
 
-def determine_max_lag_order(train_df: pd.DataFrame, max_search: int = 20) -> int:
+def determine_max_lag_order(train_df: pd.DataFrame, max_search: int = 5) -> int:
     """Determine optimal lag order using AIC on the training segment."""
     global LAG_AIC_CACHE
     LAG_AIC_CACHE = _compute_aic_by_lag(train_df, max_search=max_search)
@@ -146,6 +147,34 @@ def prepare_ml_data(
     return X_ml, y_ml
 
 
+def save_shifted_targets(
+    returns_df: pd.DataFrame,
+    horizons: Iterable[int],
+    output_dir: str | Path,
+) -> dict[int, pd.Series]:
+    """Save shifted Brent targets for multiple direct-forecast horizons."""
+    _validate_returns_columns(returns_df)
+
+    unique_horizons = sorted({int(h) for h in horizons})
+    if not unique_horizons:
+        raise ValueError("At least one horizon is required")
+    if any(h < 1 for h in unique_horizons):
+        raise ValueError("All horizons must be >= 1")
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    targets: dict[int, pd.Series] = {}
+    for horizon in unique_horizons:
+        target = returns_df["brent_return"].shift(-horizon).rename(f"target_h{horizon}").dropna()
+        target_path = output_path / f"target_h{horizon}.parquet"
+        target.to_frame(name=f"target_h{horizon}").to_parquet(target_path)
+        targets[horizon] = target
+        logger.info("Saved shifted target for horizon h={h} to {path}", h=horizon, path=target_path)
+
+    return targets
+
+
 
 def prepare_dl_data(
     returns_df: pd.DataFrame,
@@ -210,7 +239,8 @@ def save_lag_config(
 def run_feature_pipeline(
     processed_dir: str | Path = "data/processed",
     horizon: int = 1,
-    max_search: int = 20,
+    horizons: tuple[int, ...] = DEFAULT_HORIZONS,
+    max_search: int = 5,
 ) -> dict[str, pd.DataFrame | pd.Series]:
     """Run both ML and DL feature preparation branches."""
     output_dir = Path(processed_dir)
@@ -227,12 +257,24 @@ def run_feature_pipeline(
         train_end_date=str(train_df.index.max().date()),
     )
 
+    all_horizons = tuple(sorted(set(horizons + (horizon,))))
+
     X_ml, y_ml = prepare_ml_data(
         returns_df=full_returns,
         max_lag=max_lag_order,
         horizon=horizon,
         output_dir=output_dir,
         include_rolling=True,
+    )
+    extra_horizons = tuple(h for h in all_horizons if h != horizon)
+    extra_targets = (
+        save_shifted_targets(
+            returns_df=full_returns,
+            horizons=extra_horizons,
+            output_dir=output_dir,
+        )
+        if extra_horizons
+        else {}
     )
     dl_df = prepare_dl_data(returns_df=full_returns, output_dir=output_dir)
 
@@ -242,13 +284,19 @@ def run_feature_pipeline(
     return {
         "X_ml": X_ml,
         "y_ml": y_ml,
+        "targets_ml": extra_targets,
         "dl_df": dl_df,
     }
 
 
 if __name__ == "__main__":
     try:
-        run_feature_pipeline(processed_dir="data/processed", horizon=1, max_search=20)
+        run_feature_pipeline(
+            processed_dir="data/processed",
+            horizon=1,
+            horizons=DEFAULT_HORIZONS,
+            max_search=5,
+        )
     except Exception as exc:  # noqa: BLE001 - keep CLI feedback explicit
         logger.exception("Feature pipeline failed: {error}", error=str(exc))
         raise

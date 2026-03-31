@@ -30,8 +30,8 @@ class WFVConfig:
     model_family: ModelFamily = "ml"
     window_type: str = "rolling"
     max_lag_order: int = 10
-    granger_p_threshold: float = 0.05
-    vif_threshold: float = 5.0
+    granger_p_threshold: float = 0.1
+    vif_threshold: float = 10.0
     corr_threshold: float = 0.85
     top_k_shap: int = 15
     random_state: int = 42
@@ -492,14 +492,13 @@ def _run_dl_recursive_forecast(
 
     return preds_array, None, None, fit_time_total
 
-
 def run_wfv(
     X: pd.DataFrame,
     y: pd.Series | pd.DataFrame,
     model: Any,
     config: WFVConfig,
 ) -> tuple[list[WFVIteration], pd.DataFrame]:
-    """Run walk-forward validation loop."""
+    """Run walk-forward validation loop with feature and target scaling."""
     import time
     from sklearn.base import clone
     from sklearn.preprocessing import RobustScaler
@@ -516,11 +515,6 @@ def run_wfv(
                 break
         if mimo_target_col is None:
             mimo_target_col = y.columns[0]
-            logger.warning(
-                "MIMO target column not found for horizon {h}; using {col}",
-                h=config.horizon,
-                col=mimo_target_col,
-            )
     else:
         y_model = _ensure_series(y, config.horizon)
 
@@ -530,10 +524,8 @@ def run_wfv(
 
     iterations: list[WFVIteration] = []
     predictions_list: list[pd.DataFrame] = []
-
     pred_col_name = f"pred_h{config.horizon}"
     
-    # Defensive filtering for stat/dl features
     forbidden_cols = {"unique_id", "ds", "y"}
     static_features = [col for col in X.columns if col not in forbidden_cols]
     
@@ -554,57 +546,55 @@ def run_wfv(
             test_start_embargo = val_end + embargo_steps
             
             if test_start_embargo >= test_end:
-                logger.warning(
-                    "Fold {fold} skipped: embargo overlap (test_start {ts} >= test_end {te})", 
-                    fold=fold_idx, ts=test_start_embargo, te=test_end
-                )
                 continue
 
-            # Safe initialization via sklearn clone
             fold_model = clone(model)
 
-            train_slice = slice(train_start, train_end)
-            val_slice = slice(train_end, val_end)
-            test_slice = slice(test_start_embargo, test_end)
+            X_train = X.iloc[train_start:train_end]
+            X_val = X.iloc[train_end:val_end]
+            X_test = X.iloc[test_start_embargo:test_end]
 
-            X_train = X.iloc[train_slice]
-            X_val = X.iloc[val_slice]
-            X_test = X.iloc[test_slice]
-
-            y_train_raw = y_model.iloc[train_slice]
-            y_val_raw = y_model.iloc[val_slice]
-            y_test_raw = y_model.iloc[test_slice]
+            y_train_raw = y_model.iloc[train_start:train_end]
+            y_val_raw = y_model.iloc[train_end:val_end]
+            y_test_raw = y_model.iloc[test_start_embargo:test_end]
 
             y_train_target = _extract_target_series(y_train_raw, config.horizon, mimo_target_col)
             y_val_target = _extract_target_series(y_val_raw, config.horizon, mimo_target_col)
             y_test_target = _extract_target_series(y_test_raw, config.horizon, mimo_target_col)
 
-            features_to_scale = [col for col in X_train.columns if col not in forbidden_cols]
+            # Target Scaling
+            y_scaler = RobustScaler()
+            y_train_fit = pd.Series(
+                y_scaler.fit_transform(y_train_target.values.reshape(-1, 1)).flatten(),
+                index=y_train_target.index,
+                name=y_train_target.name
+            )
+            y_val_fit = pd.Series(
+                y_scaler.transform(y_val_target.values.reshape(-1, 1)).flatten(),
+                index=y_val_target.index,
+                name=y_val_target.name
+            )
+            y_test_fit = pd.Series(
+                y_scaler.transform(y_test_target.values.reshape(-1, 1)).flatten(),
+                index=y_test_target.index,
+                name=y_test_target.name
+            )
 
+            # Feature Scaling
+            features_to_scale = [col for col in X_train.columns if col not in forbidden_cols]
             scaler = RobustScaler()
-            X_train_scaled = X_train.copy()
-            X_val_scaled = X_val.copy()
-            X_test_scaled = X_test.copy()
+            X_train_scaled, X_val_scaled, X_test_scaled = X_train.copy(), X_val.copy(), X_test.copy()
 
             if features_to_scale:
                 X_train_scaled[features_to_scale] = scaler.fit_transform(X_train[features_to_scale])
                 X_val_scaled[features_to_scale] = scaler.transform(X_val[features_to_scale])
                 X_test_scaled[features_to_scale] = scaler.transform(X_test[features_to_scale])
             else:
-                scaler.center_ = np.array([])
-                scaler.scale_ = np.array([])
+                scaler.center_, scaler.scale_ = np.array([]), np.array([])
 
             if config.model_family == "ml":
-                selected_features = select_features_in_fold(
-                    X_train_scaled,
-                    y_train_target,
-                    config,
-                )
+                selected_features = select_features_in_fold(X_train_scaled, y_train_fit, config)
                 if not selected_features:
-                    logger.warning(
-                        "No features selected in fold {fold}; using all features",
-                        fold=fold_idx,
-                    )
                     selected_features = list(X_train_scaled.columns)
             else:
                 selected_features = static_features
@@ -613,58 +603,40 @@ def run_wfv(
             X_val_sel = X_val_scaled[selected_features]
             X_test_sel = X_test_scaled[selected_features]
 
-            # Strict 1D target enforcing
-            y_train_fit = y_train_target
-            y_val_fit = y_val_target
-
             fit_time = 0.0
-            lower_array: np.ndarray | None = None
-            upper_array: np.ndarray | None = None
+            lower_array, upper_array = None, None
 
             if config.model_family == "dl" and config.dl_recursive:
                 X_history = pd.concat([X_train_sel, X_val_sel], axis=0).sort_index()
-                y_history = pd.concat([y_train_target, y_val_target], axis=0).sort_index()
+                y_history = pd.concat([y_train_fit, y_val_fit], axis=0).sort_index()
                 preds_array, lower_array, upper_array, fit_time = _run_dl_recursive_forecast(
                     model=fold_model,
                     X_history=X_history,
                     y_history=y_history,
                     X_test=X_test_sel,
-                    y_test=y_test_target,
+                    y_test=y_test_fit,
                     interval_alpha=config.interval_alpha,
                 )
             else:
                 start_time = time.perf_counter()
-                _safe_fit_model(
-                    fold_model,
-                    X_train_sel,
-                    y_train_fit,
-                    X_val=X_val_sel,
-                    y_val=y_val_fit,
-                )
+                _safe_fit_model(fold_model, X_train_sel, y_train_fit, X_val=X_val_sel, y_val=y_val_fit)
                 fit_time = time.perf_counter() - start_time
 
                 preds_raw = fold_model.predict(X_test_sel)
-                preds_array = _align_prediction_length(
-                    preds_raw,
-                    expected=len(X_test_sel),
-                    context=f"predict_fold_{fold_idx}",
-                )
-                lower_array, upper_array = _safe_predict_interval(
-                    model=fold_model,
-                    X_test=X_test_sel,
-                    expected=len(X_test_sel),
-                    alpha=config.interval_alpha,
-                )
+                preds_array = _align_prediction_length(preds_raw, len(X_test_sel), f"predict_fold_{fold_idx}")
+                lower_array, upper_array = _safe_predict_interval(fold_model, X_test_sel, len(X_test_sel), config.interval_alpha)
+
+            # Inverse Target Scaling
+            preds_array = y_scaler.inverse_transform(preds_array.reshape(-1, 1)).flatten()
+            if lower_array is not None:
+                lower_array = y_scaler.inverse_transform(lower_array.reshape(-1, 1)).flatten()
+            if upper_array is not None:
+                upper_array = y_scaler.inverse_transform(upper_array.reshape(-1, 1)).flatten()
 
             actuals_array = _to_1d_float(y_test_target)
-
-            fold_predictions = pd.DataFrame(
-                {pred_col_name: preds_array},
-                index=X_test_sel.index,
-            )
+            fold_predictions = pd.DataFrame({pred_col_name: preds_array}, index=X_test_sel.index)
             if lower_array is not None and upper_array is not None:
-                fold_predictions["lower"] = lower_array
-                fold_predictions["upper"] = upper_array
+                fold_predictions["lower"], fold_predictions["upper"] = lower_array, upper_array
 
             predictions_list.append(fold_predictions)
             consecutive_failures = 0
@@ -689,36 +661,17 @@ def run_wfv(
                 )
             )
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             consecutive_failures += 1
-            logger.exception(
-                "Fold {fold} failed (model_family={family}): {error}",
-                fold=fold_idx,
-                family=config.model_family,
-                error=str(exc),
-            )
-
-            if _is_incompatible_model_error(exc, config.horizon):
+            if _is_incompatible_model_error(exc, config.horizon) or consecutive_failures >= config.max_consecutive_failures:
                 skip_model = True
-                logger.warning("Stopping WFV for model due to incompatibility at fold {fold}", fold=fold_idx)
                 break
-
-            if consecutive_failures >= config.max_consecutive_failures:
-                skip_model = True
-                logger.error("Stopping WFV after {n} consecutive fold failures", n=config.max_consecutive_failures)
-                break
-
             continue
 
     if skip_model:
-        iterations = []
-        predictions_list = []
+        return [], pd.DataFrame(columns=[pred_col_name])
 
-    if predictions_list:
-        predictions_df = pd.concat(predictions_list, axis=0).sort_index()
-    else:
-        predictions_df = pd.DataFrame(columns=[pred_col_name])
-
+    predictions_df = pd.concat(predictions_list, axis=0).sort_index() if predictions_list else pd.DataFrame(columns=[pred_col_name])
     predictions_df.attrs["horizon"] = config.horizon
     return iterations, predictions_df
 

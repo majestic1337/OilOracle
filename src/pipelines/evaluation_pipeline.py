@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,13 @@ def _parse_prediction_name(path: Path) -> str:
     horizon = parts[-1].lstrip("h")
     model_name = "_".join(parts[1:-1])
     return f"{model_name}_h{horizon}"
+
+
+def _extract_horizon_from_model_key(model_key: str) -> int:
+    match = re.search(r"_h(\d+)$", model_key)
+    if not match:
+        return 1
+    return int(match.group(1))
 
 
 def load_all_predictions(processed_dir: str | Path) -> dict[str, pd.Series]:
@@ -153,9 +161,7 @@ def evaluate_experiment_a(
             dm_p = 1.0
         else:
             model_errors = y_test_model - preds_model
-            horizon = 1
-            if model_name.endswith("_h7"):
-                horizon = 7
+            horizon = _extract_horizon_from_model_key(model_name)
             dm_result = diebold_mariano_test(model_errors, baseline_errors, h=horizon)
             dm_stat = float(dm_result["dm_statistic"])
             dm_p = float(dm_result["p_value"])
@@ -349,23 +355,28 @@ def generate_results_tables(all_results: dict[str, pd.DataFrame], output_dir: st
     if "experiment_a" in all_results:
         all_results["experiment_a"].to_csv(output_path / "results_experiment_a.csv")
     else:
-        if "experiment_a_h1" in all_results:
-            all_results["experiment_a_h1"].to_csv(output_path / "results_experiment_a_h1.csv")
-        if "experiment_a_h7" in all_results:
-            all_results["experiment_a_h7"].to_csv(output_path / "results_experiment_a_h7.csv")
+        experiment_a_keys = sorted(
+            key for key in all_results if key.startswith("experiment_a_h")
+        )
+        for key in experiment_a_keys:
+            all_results[key].to_csv(output_path / f"results_{key}.csv")
 
     if "experiment_b" in all_results:
         all_results["experiment_b"].to_csv(output_path / "results_experiment_b.csv")
     else:
-        if "experiment_b_h1" in all_results:
-            all_results["experiment_b_h1"].to_csv(output_path / "results_experiment_b_h1.csv")
-        if "experiment_b_h7" in all_results:
-            all_results["experiment_b_h7"].to_csv(output_path / "results_experiment_b_h7.csv")
+        experiment_b_keys = sorted(
+            key for key in all_results if key.startswith("experiment_b_h")
+        )
+        for key in experiment_b_keys:
+            all_results[key].to_csv(output_path / f"results_{key}.csv")
 
     if "regimes" in all_results:
         all_results["regimes"].to_csv(output_path / "results_regimes.csv")
 
-    for horizon_key in ("experiment_a_h1", "experiment_a_h7"):
+    horizon_keys = sorted(
+        key for key in all_results if key.startswith("experiment_a_h")
+    )
+    for horizon_key in horizon_keys:
         if horizon_key in all_results:
             result = all_results[horizon_key]
             if "MASE" in result.columns:
@@ -381,9 +392,13 @@ if __name__ == "__main__":
     processed_dir = Path("data/processed")
     predictions = load_all_predictions(processed_dir)
 
-    # Визначаємо наявні горизонти прогнозів
-    preds_h1 = {k: v for k, v in predictions.items() if k.endswith("_h1")}
-    preds_h7 = {k: v for k, v in predictions.items() if k.endswith("_h7")}
+    preds_by_horizon: dict[int, dict[str, pd.Series]] = {}
+    for model_key, series in predictions.items():
+        horizon = _extract_horizon_from_model_key(model_key)
+        preds_by_horizon.setdefault(horizon, {})[model_key] = series
+
+    if not preds_by_horizon:
+        raise ValueError("No predictions with horizon suffix were found (expected *_h<k>).")
 
     def load_test_target(horizon: int) -> pd.Series:
         """Load the correctly shifted target for evaluation to prevent data leakage."""
@@ -425,40 +440,44 @@ if __name__ == "__main__":
     def has_baseline(preds_dict: dict) -> bool:
         return any("random_walk" in k or "randomwalk" in k for k in preds_dict)
 
-    if preds_h1:
-        y_test_h1 = load_test_target(horizon=1)
-        if has_baseline(preds_h1):
-            all_results["experiment_a_h1"] = evaluate_experiment_a(preds_h1, y_test_h1, y_train_last_window)
-        all_results["experiment_b_h1"] = evaluate_experiment_b(preds_h1, y_test_h1)
-        regime_results_h1 = regime_analysis(preds_h1, y_test_h1, regimes)
-        regime_results_h1["horizon"] = 1
-        all_results["regimes_h1"] = regime_results_h1
+    regimes_parts: list[pd.DataFrame] = []
+    for horizon in sorted(preds_by_horizon):
+        preds_h = preds_by_horizon[horizon]
+        y_test_h = load_test_target(horizon=horizon)
 
-    if preds_h7:
-        y_test_h7 = load_test_target(horizon=7)
-        if has_baseline(preds_h7):
-            all_results["experiment_a_h7"] = evaluate_experiment_a(preds_h7, y_test_h7, y_train_last_window)
-        all_results["experiment_b_h7"] = evaluate_experiment_b(preds_h7, y_test_h7)
-        regime_results_h7 = regime_analysis(preds_h7, y_test_h7, regimes)
-        regime_results_h7["horizon"] = 7
-        all_results["regimes_h7"] = regime_results_h7
+        if has_baseline(preds_h):
+            all_results[f"experiment_a_h{horizon}"] = evaluate_experiment_a(
+                preds_h,
+                y_test_h,
+                y_train_last_window,
+            )
+        else:
+            logger.warning(
+                "Skipping Experiment A for h={h}: Random Walk baseline not found.",
+                h=horizon,
+            )
 
-    if "regimes_h1" in all_results and "regimes_h7" in all_results:
-        all_results["regimes"] = pd.concat([all_results["regimes_h1"], all_results["regimes_h7"]])
-    elif "regimes_h1" in all_results:
-        all_results["regimes"] = all_results["regimes_h1"]
-    elif "regimes_h7" in all_results:
-        all_results["regimes"] = all_results["regimes_h7"]
+        all_results[f"experiment_b_h{horizon}"] = evaluate_experiment_b(preds_h, y_test_h)
+        regime_results_h = regime_analysis(preds_h, y_test_h, regimes)
+        regime_results_h["horizon"] = horizon
+        all_results[f"regimes_h{horizon}"] = regime_results_h
+        regimes_parts.append(regime_results_h)
+
+    if regimes_parts:
+        all_results["regimes"] = pd.concat(regimes_parts)
 
     generate_results_tables(all_results, output_dir=processed_dir)
 
     if "experiment_a_h1" in all_results and "experiment_a_h7" in all_results:
-        summary_table = compare_horizons(all_results["experiment_a_h1"], all_results["experiment_a_h7"])
+        summary_table = compare_horizons(
+            all_results["experiment_a_h1"],
+            all_results["experiment_a_h7"],
+        )
         print("\nExperiment A Summary (h1 vs h7)\n")
         print(summary_table.to_string())
-    elif "experiment_a_h1" in all_results:
-        print("\nExperiment A Summary (h1 only)\n")
-        print(all_results["experiment_a_h1"].to_string())
-    elif "experiment_a_h7" in all_results:
-        print("\nExperiment A Summary (h7 only)\n")
-        print(all_results["experiment_a_h7"].to_string())
+
+    experiment_a_keys = sorted(key for key in all_results if key.startswith("experiment_a_h"))
+    for key in experiment_a_keys:
+        if key not in {"experiment_a_h1", "experiment_a_h7"}:
+            print(f"\nExperiment A Summary ({key})\n")
+            print(all_results[key].to_string())
