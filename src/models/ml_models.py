@@ -36,12 +36,12 @@ class XGBoostForecaster(BaseForecaster):
         except ImportError as exc:
             raise ImportError("xgboost is required") from exc
 
-        # Використання MSE для медіани (q50) для стабілізації в умовах шуму
-        objective = "reg:squarederror" if quantile == 0.5 else "reg:quantileerror"
+        # Use quantile objective for all quantiles, including q50 (median).
+        objective = "reg:quantileerror"
         
         return XGBRegressor(
             objective=objective,
-            quantile_alpha=quantile if objective == "reg:quantileerror" else None,
+            quantile_alpha=quantile,
             n_estimators=200,         
             learning_rate=0.05,       
             max_depth=2,              
@@ -133,12 +133,12 @@ class LightGBMForecaster(BaseForecaster):
         except ImportError as exc:
             raise ImportError("lightgbm is required") from exc
 
-        # Використання MSE для медіани (q50) для стабілізації в умовах шуму
-        objective = "regression" if quantile == 0.5 else "quantile"
+        # Use quantile objective for all quantiles, including q50 (median).
+        objective = "quantile"
         
         return LGBMRegressor(
             objective=objective,
-            alpha=quantile if objective == "quantile" else None,
+            alpha=quantile,
             n_estimators=1000,
             learning_rate=0.01,
             num_leaves=31,
@@ -305,7 +305,7 @@ class AdaptiveConformalWrapper(BaseForecaster):
             raise ValueError("y_true and y_pred must have the same shape")
 
         # C4: Correct ACI update (Gibbs & Candès, 2021).
-        # q̂_{t+1} = q̂_t + γ(α − 𝟙{|e_t| > q̂_t})
+        # q̂_{t+1} = q̂_t + γ(𝟙{|e_t| > q̂_t} − α)
         for err in np.abs(y_true_arr - y_pred_arr):
             indicator = 1.0 if err > self.q_hat else 0.0
-            self.q_hat = self.q_hat + self.gamma * (self.alpha - indicator)
+            self.q_hat = self.q_hat + self.gamma * (indicator - self.alpha)

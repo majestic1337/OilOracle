@@ -198,11 +198,26 @@ def evaluate_experiment_a(
     """
     y_test_series = _to_series(y_test)
     train_window = _to_series(y_train_last_window)
+    train_diff = np.abs(np.diff(train_window.values))
+    mae_naive_train = float(np.mean(train_diff)) if len(train_diff) > 0 else 1.0
 
-    baseline_key = _find_baseline_key(predictions_dict)
-    baseline_pred = predictions_dict[baseline_key]
-    y_test_aligned, baseline_pred = _align_series(y_test_series, baseline_pred)
-    baseline_errors = y_test_aligned - baseline_pred
+    if not np.isfinite(mae_naive_train) or mae_naive_train <= 0.0:
+        logger.warning(
+            "Invalid MASE denominator ({value}); fallback to 1.0",
+            value=mae_naive_train,
+        )
+        mae_naive_train = 1.0
+
+    baseline_key: str | None = None
+    baseline_errors: pd.Series | None = None
+    try:
+        baseline_key = _find_baseline_key(predictions_dict)
+        baseline_pred = predictions_dict[baseline_key]
+        y_test_aligned, baseline_pred = _align_series(y_test_series, baseline_pred)
+        baseline_errors = y_test_aligned - baseline_pred
+    except ValueError:
+        logger.warning("Random Walk baseline not found; DM test will be skipped for Experiment A.")
+        baseline_errors = None
 
     rows: list[dict[str, Any]] = []
     for model_name, preds in predictions_dict.items():
@@ -212,21 +227,39 @@ def evaluate_experiment_a(
             logger.warning(f"Skipping evaluate_experiment_a for {model_name}: aligned series is empty.")
             continue
 
-        mase = calculate_window_mase(train_window, y_test_model, preds_model, m=1)
-        rmse = float(np.sqrt(np.mean((y_test_model - preds_model) ** 2)))
         mae = float(np.mean(np.abs(y_test_model - preds_model)))
+        mase = mae / mae_naive_train
+        rmse = float(np.sqrt(np.mean((y_test_model - preds_model) ** 2)))
 
-        if model_name == baseline_key:
+        if baseline_errors is not None and model_name == baseline_key:
             dm_stat = 0.0
             dm_p = 1.0
+            beats_rw = False
+        elif baseline_errors is not None and baseline_key is not None:
+            baseline_pred_model = predictions_dict[baseline_key]
+            common_index_dm = y_test_model.index.intersection(baseline_pred_model.index)
+            if len(common_index_dm) == 0:
+                logger.warning(
+                    "Skipping DM test for {model}: no overlap with baseline predictions",
+                    model=model_name,
+                )
+                dm_stat = float("nan")
+                dm_p = float("nan")
+                beats_rw = False
+            else:
+                model_errors = y_test_model.loc[common_index_dm] - preds_model.loc[common_index_dm]
+                baseline_errors_model = (
+                    y_test_model.loc[common_index_dm] - baseline_pred_model.loc[common_index_dm]
+                )
+                horizon = _extract_horizon_from_model_key(model_name)
+                dm_result = diebold_mariano_test(model_errors, baseline_errors_model, h=horizon)
+                dm_stat = float(dm_result["dm_statistic"])
+                dm_p = float(dm_result["p_value"])
+                beats_rw = bool(dm_p < 0.05 and dm_stat < 0)
         else:
-            model_errors = y_test_model - preds_model
-            horizon = _extract_horizon_from_model_key(model_name)
-            dm_result = diebold_mariano_test(model_errors, baseline_errors, h=horizon)
-            dm_stat = float(dm_result["dm_statistic"])
-            dm_p = float(dm_result["p_value"])
-
-        beats_rw = bool(dm_p < 0.05 and dm_stat < 0)
+            dm_stat = float("nan")
+            dm_p = float("nan")
+            beats_rw = False
 
         rows.append(
             {
@@ -495,31 +528,21 @@ if __name__ == "__main__":
     y_train_last_window = train_series.tail(w_train)
 
     regimes = {
-        "post_covid": ("2021-01-01", "2022-02-23"),
-        "ukraine_war": ("2022-02-24", "2023-06-30"),
-        "normalization": ("2023-07-01", "2026-03-10"),
+        "opec_cuts": ("2024-01-01", "2024-06-30"),
+        "normalization": ("2024-07-01", "2026-03-10"),
     }
     all_results = {}
-
-    def has_baseline(preds_dict: dict) -> bool:
-        return any("random_walk" in k or "randomwalk" in k for k in preds_dict)
 
     regimes_parts: list[pd.DataFrame] = []
     for horizon in sorted(preds_by_horizon):
         preds_h = preds_by_horizon[horizon]
         y_test_h = load_test_target(horizon=horizon)
 
-        if has_baseline(preds_h):
-            all_results[f"experiment_a_h{horizon}"] = evaluate_experiment_a(
-                preds_h,
-                y_test_h,
-                y_train_last_window,
-            )
-        else:
-            logger.warning(
-                "Skipping Experiment A for h={h}: Random Walk baseline not found.",
-                h=horizon,
-            )
+        all_results[f"experiment_a_h{horizon}"] = evaluate_experiment_a(
+            preds_h,
+            y_test_h,
+            y_train_last_window,
+        )
 
         all_results[f"experiment_b_h{horizon}"] = evaluate_experiment_b(preds_h, y_test_h)
         regime_results_h = regime_analysis(preds_h, y_test_h, regimes)

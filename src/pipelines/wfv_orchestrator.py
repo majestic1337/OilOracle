@@ -47,6 +47,11 @@ class WFVConfig:
             raise ValueError("model_family must be one of {'ml', 'dl', 'stat'}")
         if self.task_type not in {"regression", "classification"}:
             raise ValueError("task_type must be 'regression' or 'classification'")
+        if self.w_step <= self.horizon - 1:
+            raise ValueError(
+                f"w_step ({self.w_step}) must be > horizon - 1 ({self.horizon - 1}) "
+                "to ensure test samples exist after embargo."
+            )
 
     @property
     def model_kwargs(self) -> dict[str, int]:
@@ -133,25 +138,6 @@ def _align_prediction_length(values: Any, expected: int, context: str) -> np.nda
         return np.repeat(arr[0], expected)
 
     return np.pad(arr, (0, expected - arr.size), mode="edge")
-
-
-def _to_cumulative_log_returns(prices: np.ndarray, base_prices: np.ndarray) -> np.ndarray:
-    """Convert price forecasts to cumulative log-returns with safe guards."""
-    prices_arr = _to_1d_float(prices)
-    base_arr = _to_1d_float(base_prices)
-
-    min_len = min(len(prices_arr), len(base_arr))
-    if min_len == 0:
-        return np.array([], dtype=float)
-
-    prices_arr = prices_arr[-min_len:]
-    base_arr = base_arr[-min_len:]
-
-    invalid_mask = (prices_arr <= 0.0) | (base_arr <= 0.0) | np.isnan(prices_arr) | np.isnan(base_arr)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        converted = np.log(prices_arr / base_arr)
-    converted[invalid_mask] = np.nan
-    return converted
 
 
 def _safe_fit_model(
@@ -285,9 +271,25 @@ def _select_features_shap(X_train: pd.DataFrame, y_train: pd.Series, config: WFV
         import lightgbm as lgb
         import shap
     except ImportError:
+        logger.warning("SHAP dependencies are unavailable; using all features")
         return list(X_train.columns)
 
-    model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=31, random_state=config.random_state, verbose=-1)
+    if config.task_type == "classification":
+        model = lgb.LGBMClassifier(
+            n_estimators=200,
+            learning_rate=0.05,
+            num_leaves=31,
+            random_state=config.random_state,
+            verbose=-1,
+        )
+    else:
+        model = lgb.LGBMRegressor(
+            n_estimators=200,
+            learning_rate=0.05,
+            num_leaves=31,
+            random_state=config.random_state,
+            verbose=-1,
+        )
 
     try:
         X_values = X_train.to_numpy()
@@ -296,11 +298,28 @@ def _select_features_shap(X_train: pd.DataFrame, y_train: pd.Series, config: WFV
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_values)
         shap_array = np.asarray(shap_values)
+
         if shap_array.ndim == 1:
             shap_importance = np.abs(shap_array)
-        else:
+        elif shap_array.ndim == 2:
+            # Typical tree-based SHAP output for regression/binary classification:
+            # shape (n_samples, n_features). Aggregate over samples.
             shap_importance = np.abs(shap_array).mean(axis=0)
-    except Exception:  # noqa: BLE001
+        elif shap_array.ndim == 3:
+            # Multiclass SHAP output can include class dimension.
+            # Aggregate over all axes except the feature axis.
+            shap_importance = np.abs(shap_array).mean(axis=(0, 1))
+        else:
+            raise ValueError(f"Unexpected SHAP output dimensions: {shap_array.ndim}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SHAP selection failed; using all features: {error}", error=str(exc))
+        return list(X_train.columns)
+
+    if shap_importance.ndim != 1 or shap_importance.shape[0] != X_train.shape[1]:
+        logger.warning(
+            "SHAP importance shape mismatch ({shape}); using all features",
+            shape=shap_importance.shape,
+        )
         return list(X_train.columns)
 
     importance_series = pd.Series(shap_importance, index=X_train.columns)
@@ -309,22 +328,10 @@ def _select_features_shap(X_train: pd.DataFrame, y_train: pd.Series, config: WFV
 
 
 def select_features_in_fold(X_train: pd.DataFrame, y_train: pd.Series, config: WFVConfig) -> list[str]:
-    selected, f_stats = _select_features_granger(X_train, y_train, config)
-    if not selected:
-        return list(X_train.columns)
-
-    vif_features = _select_features_vif(X_train[selected], config)
-    if not vif_features:
-        return selected
-
-    corr_features = _select_features_correlation(X_train[vif_features], f_stats, config)
-    if not corr_features:
-        return vif_features
-
-    shap_features = _select_features_shap(X_train[corr_features], y_train, config)
+    """Select ML features using SHAP-only marginal contribution ranking."""
+    shap_features = _select_features_shap(X_train, y_train, config)
     if not shap_features:
-        return corr_features
-
+        return list(X_train.columns)
     return shap_features
 
 
@@ -560,20 +567,6 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
                     upper_array = y_scaler.inverse_transform(upper_array.reshape(-1, 1)).flatten()
 
             actuals_array = _to_1d_float(y_test_target)
-
-            # DL price-space predictions to cumulative log-return space
-            if config.model_family == "dl" and config.task_type == "regression":
-                base_prices = _to_1d_float(y_model.loc[X_test_sel.index])
-                # DL targets must represent the price at T+h to yield meaningful log returns
-                shifted_y_model = y_model.shift(-config.horizon)
-                actuals_array = _to_1d_float(shifted_y_model.loc[X_test_sel.index])
-
-                preds_array = _to_cumulative_log_returns(preds_array, base_prices)
-                actuals_array = _to_cumulative_log_returns(actuals_array, base_prices)
-                if lower_array is not None:
-                    lower_array = _to_cumulative_log_returns(lower_array, base_prices)
-                if upper_array is not None:
-                    upper_array = _to_cumulative_log_returns(upper_array, base_prices)
 
             fold_predictions = pd.DataFrame({pred_col_name: preds_array}, index=X_test_sel.index)
             if lower_array is not None and upper_array is not None:

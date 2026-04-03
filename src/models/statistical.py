@@ -153,7 +153,7 @@ class ARIMAGARCHModel(BaseForecaster):
         self.max_p = max_p
         self.max_q = max_q
         self.random_state = random_state
-        self._horizon = horizon
+        self.horizon = horizon
         self.task_type = task_type
         self.arima_model: Any | None = None
         self.garch_model: Any | None = None
@@ -192,9 +192,23 @@ class ARIMAGARCHModel(BaseForecaster):
 
         series = np.asarray(y_fit, dtype=float).squeeze()
         if series.size == 0:
-            raise ValueError("X_train is empty; cannot fit ARIMAGARCHModel")
+            raise ValueError("y_train is empty; cannot fit ARIMAGARCHModel")
 
-        self._fallback.fit(X_fit, y_fit)
+        try:
+            self._fallback.fit(X_fit, y_fit)
+        except Exception as exc:  # noqa: BLE001 - fallback must never block ARIMA path
+            self._logger.warning(
+                "RandomWalk fallback fit failed on raw inputs; retrying with sanitized series: {error}",
+                error=str(exc),
+            )
+            try:
+                fallback_X = np.zeros((series.size, 1), dtype=float)
+                self._fallback.fit(fallback_X, series)
+            except Exception as retry_exc:  # noqa: BLE001
+                self._logger.warning(
+                    "RandomWalk fallback fit retry failed; predictions may use default state: {error}",
+                    error=str(retry_exc),
+                )
 
         try:
             from pmdarima import auto_arima
@@ -269,11 +283,13 @@ class ARIMAGARCHModel(BaseForecaster):
             raise ValueError("GARCH model is not fitted")
 
         forecast = self.garch_model.forecast(horizon=steps, reindex=False)
-        variance = forecast.variance
-        variance_array = np.asarray(variance)
-        if variance_array.ndim == 1:
-            return variance_array
-        return variance_array[-1]
+        variance_series = forecast.variance.iloc[-1]
+        variance_array = np.asarray(variance_series, dtype=float).squeeze()
+        if variance_array.ndim == 0:
+            return np.asarray([float(variance_array)], dtype=float)
+        if variance_array.ndim > 1:
+            return np.asarray(variance_array, dtype=float).reshape(-1)
+        return variance_array
 
     def predict(self, X: Any) -> np.ndarray:
         """Forecast conditional mean; fallback to RandomWalk on failure.
@@ -288,8 +304,14 @@ class ARIMAGARCHModel(BaseForecaster):
             return self._fallback.predict(X)
 
         try:
-            total_steps = max((self._horizon - 1) + steps, 1)
+            total_steps = max((self.horizon - 1) + steps, 1)
             mean_forecast = self._forecast_mean(total_steps)
+            mean_forecast = np.asarray(mean_forecast, dtype=float).squeeze()
+            if mean_forecast.ndim == 0:
+                mean_forecast = np.asarray([float(mean_forecast)], dtype=float)
+            elif mean_forecast.ndim > 1:
+                mean_forecast = np.asarray(mean_forecast, dtype=float).reshape(-1)
+
             if mean_forecast.size < steps:
                 if mean_forecast.size == 0:
                     return np.full(steps, np.nan, dtype=float)
@@ -313,9 +335,19 @@ class ARIMAGARCHModel(BaseForecaster):
             return self._fallback.predict_interval(X, alpha=alpha)
 
         try:
-            total_steps = max((self._horizon - 1) + steps, 1)
+            total_steps = max((self.horizon - 1) + steps, 1)
             mean = self._forecast_mean(total_steps)
             variance = self._forecast_variance(total_steps)
+            mean = np.asarray(mean, dtype=float).squeeze()
+            variance = np.asarray(variance, dtype=float).squeeze()
+            if mean.ndim == 0:
+                mean = np.asarray([float(mean)], dtype=float)
+            elif mean.ndim > 1:
+                mean = np.asarray(mean, dtype=float).reshape(-1)
+            if variance.ndim == 0:
+                variance = np.asarray([float(variance)], dtype=float)
+            elif variance.ndim > 1:
+                variance = np.asarray(variance, dtype=float).reshape(-1)
         except Exception as exc:  # noqa: BLE001 - robust fallback
             self._logger.warning(
                 "GARCH interval failed; fallback to RandomWalk: {error}",
@@ -325,6 +357,7 @@ class ARIMAGARCHModel(BaseForecaster):
 
         z = float(norm.ppf(1.0 - alpha / 2.0))
         garch_scale = self.garch_scale_ if self.garch_scale_ else 1.0
+        variance = np.maximum(variance, 0.0)
         std = np.sqrt(variance) / garch_scale
         if mean.size < steps:
             if mean.size == 0:

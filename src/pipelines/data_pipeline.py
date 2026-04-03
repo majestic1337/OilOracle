@@ -76,8 +76,45 @@ def load_raw_data(engine: Engine) -> pd.DataFrame:
     for asset, table_name in TABLE_MAP.items():
         frames.append(_read_price_table(engine, table_name, asset))
 
-    wide_df = pd.concat(frames, axis=1, join="outer").sort_index()
+    wide_df = pd.concat(frames, axis=1, join="outer", sort=True).sort_index()
     return wide_df
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute technical indicators (RSI, MACD) for Brent.
+    
+    Args:
+        df: Aligned DataFrame with price columns.
+        
+    Returns:
+        Original DataFrame with appended indicator columns.
+    """
+    if "brent" not in df.columns:
+        return df
+
+    out_df = df.copy()
+    brent = out_df["brent"]
+
+    # RSI (14 days)
+    delta = brent.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    avg_gain = gain.ewm(span=14, adjust=False).mean()
+    avg_loss = loss.ewm(span=14, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    out_df["brent_rsi"] = 100.0 - (100.0 / (1.0 + rs))
+
+    # MACD
+    ema12 = brent.ewm(span=12, adjust=False).mean()
+    ema26 = brent.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+
+    out_df["brent_macd"] = macd_line
+    out_df["brent_signal"] = signal_line
+
+    return out_df
 
 
 def align_series(df: pd.DataFrame) -> pd.DataFrame:
@@ -120,10 +157,10 @@ def compute_log_returns(df: pd.DataFrame) -> pd.DataFrame:
     """Compute log returns for each asset series.
 
     Args:
-        df: Aligned DataFrame with price columns.
+        df: Aligned DataFrame with price columns and indicators.
 
     Returns:
-        DataFrame of log returns with *_return suffixes.
+        DataFrame of log returns with *_return suffixes and unchanged indicators.
 
     Note:
         WTI квітень 2020 містить від'ємні futures ціни (артефакт ринкової
@@ -131,8 +168,11 @@ def compute_log_returns(df: pd.DataFrame) -> pd.DataFrame:
         згадана в тезисі як data quality exception.
     """
     df = df.sort_index()
+    price_cols = [c for c in ["brent", "wti", "dxy", "gold"] if c in df.columns]
+    indicator_cols = [c for c in df.columns if c not in price_cols]
+
     # Логуємо які саме дати мають проблемні значення
-    for col in df.columns:
+    for col in price_cols:
         bad_dates = df.index[df[col] <= 0].tolist()
         if bad_dates:
             logger.warning(
@@ -140,20 +180,26 @@ def compute_log_returns(df: pd.DataFrame) -> pd.DataFrame:
                 f"— replacing with NaN before log-returns"
             )
 
-    # Замінюємо non-positive на NaN
-    df = df.where(df > 0, other=np.nan)
+    # Замінюємо non-positive на NaN для цін
+    df_prices = df[price_cols].where(df[price_cols] > 0, other=np.nan)
 
     # Forward fill максимум 1 день (сусідня ціна як proxy)
     # КРИТИЧНО: тільки ffill(limit=1), не більше
-    df = df.ffill(limit=1)
+    df_prices = df_prices.ffill(limit=1)
 
-    # Якщо після ffill залишились NaN — дропаємо рядок
-    df = df.dropna()
+    df_combined = pd.concat([df_prices, df[indicator_cols]], axis=1)
+
+    # Якщо після ffill або через розрахунок індикаторів є NaN — дропаємо рядок
+    df_combined = df_combined.dropna()
+
     # Returns across weekends/holidays will naturally accumulate due to the shift.
-    returns = np.log(df / df.shift(1))
-    returns = returns.iloc[1:]
-    returns = returns.add_suffix("_return")
-    return returns
+    returns_prices = np.log(df_combined[price_cols] / df_combined[price_cols].shift(1))
+    returns_prices = returns_prices.add_suffix("_return")
+
+    returns_combined = pd.concat([returns_prices, df_combined[indicator_cols]], axis=1)
+    returns_combined = returns_combined.iloc[1:]
+    
+    return returns_combined
 
 
 def run_stationarity_diagnostics(returns_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
@@ -276,6 +322,7 @@ if __name__ == "__main__":
 
     raw_df = load_raw_data(engine)
     aligned_df = align_series(raw_df)
+    aligned_df = compute_indicators(aligned_df)
     returns_df = compute_log_returns(aligned_df)
     diagnostics = run_stationarity_diagnostics(returns_df)
     split_sets = create_train_val_test_split(aligned_df=aligned_df, returns_df=returns_df)

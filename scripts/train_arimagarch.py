@@ -38,7 +38,7 @@ def run_training(
     p = max_p if max_p is not None else int(model_cfg.get("max_p", 5))
     q = max_q if max_q is not None else int(model_cfg.get("max_q", 2))
 
-    model = ARIMAGARCHModel(max_p=p, max_q=q)
+    model = ARIMAGARCHModel(max_p=p, max_q=q, horizon=horizon)
     wfv_config = build_wfv_config(config_payload, horizon=horizon, model_family="stat")
 
     try:

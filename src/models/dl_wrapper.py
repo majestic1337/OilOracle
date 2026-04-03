@@ -60,6 +60,25 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         self._logger.info("Using CPU for DL training (GPU disabled)")
 
+    def get_params(self, deep: bool = True) -> dict[str, Any]:
+        """Override get_params to correctly clone **kwargs for NeuralForecast."""
+        params: dict[str, Any] = {
+            "model_class": self.model_class,
+            "horizon": self.horizon,
+            "input_size": self.input_size,
+        }
+        params.update(self.model_kwargs)
+        return params
+
+    def set_params(self, **params: Any) -> "DeepLearningForecasterWrapper":
+        """Override set_params to restore **kwargs."""
+        for key, value in params.items():
+            if key in {"model_class", "horizon", "input_size"}:
+                setattr(self, key, value)
+            else:
+                self.model_kwargs[key] = value
+        return self
+
     def _prepare_df(self, X: pd.DataFrame, y: pd.Series = None) -> pd.DataFrame:
         df = pd.DataFrame(
             {
@@ -97,9 +116,20 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         signature = inspect.signature(self.model_class)
         if self._supports_exogenous():
-            for param in ("futr_exog_list", "hist_exog_list"):
-                if param in signature.parameters and exog_columns and param not in model_kwargs:
-                    model_kwargs[param] = exog_columns
+            # Prevent leakage: never pass financial features as future exogenous inputs.
+            if "futr_exog_list" in model_kwargs:
+                model_kwargs.pop("futr_exog_list", None)
+                self._logger.warning(
+                    "Ignoring futr_exog_list in model kwargs to prevent leakage; "
+                    "using hist_exog_list only."
+                )
+
+            if (
+                "hist_exog_list" in signature.parameters
+                and exog_columns
+                and "hist_exog_list" not in model_kwargs
+            ):
+                model_kwargs["hist_exog_list"] = exog_columns
 
         return self.model_class(**model_kwargs)
 

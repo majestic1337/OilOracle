@@ -192,24 +192,34 @@ def load_stat_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Serie
 
 
 def load_dl_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Series]:
-    """Load DL features. 
-    
-    Target shift semantics depend on the specific DL framework (e.g., NeuralForecast 
-    handles horizons internally via `h`, so the raw unshifted matrix is returned).
+    """Load DL data in log-return space aligned with ML semantics.
+
+    Uses:
+    - `feature_matrix_ml.parquet` as exogenous predictors
+    - `target_h{horizon}.parquet` as shifted target in return space
+
+    Returned X contains NeuralForecast-compatible metadata columns
+    (`unique_id`, `ds`) plus exogenous predictors. Target y is the shifted
+    return series named `y`.
     """
-    dl_path = data_dir / "feature_matrix_dl.parquet"
-    if not dl_path.exists():
-        raise FileNotFoundError(f"DL feature matrix not found: {dl_path}")
+    feature_path = data_dir / "feature_matrix_ml.parquet"
+    if not feature_path.exists():
+        raise FileNotFoundError(f"ML feature matrix not found for DL training: {feature_path}")
 
-    df = pd.read_parquet(dl_path)
-    if "ds" in df.columns:
-        df["ds"] = pd.to_datetime(df["ds"])
-        df = df.set_index("ds")
-    
-    if "y" not in df.columns:
-        raise ValueError("feature_matrix_dl.parquet must contain 'y' column")
+    target_path = data_dir / f"target_h{horizon}.parquet"
+    if not target_path.exists():
+        raise FileNotFoundError(f"Target file not found: {target_path}")
 
-    y = df["y"].astype(float)
-    X = df.drop(columns=["y"])
-    
-    return X.sort_index(), y.sort_index()
+    X_ml = pd.read_parquet(feature_path)
+    y_shifted = pd.read_parquet(target_path)
+    y_obj = y_shifted.iloc[:, 0]
+
+    common_index = X_ml.index.intersection(y_obj.index)
+    X_aligned = X_ml.loc[common_index].sort_index()
+    y_aligned = y_obj.loc[common_index].sort_index().astype(float).rename("y")
+
+    X_dl = X_aligned.copy()
+    X_dl.insert(0, "unique_id", "brent")
+    X_dl.insert(1, "ds", pd.DatetimeIndex(X_dl.index))
+
+    return X_dl, y_aligned

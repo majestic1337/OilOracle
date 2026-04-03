@@ -24,7 +24,8 @@ DEFAULT_HORIZONS: tuple[int, ...] = (1, 3, 5, 7)
 
 
 def _validate_returns_columns(df: pd.DataFrame) -> None:
-    missing = [column for column in REQUIRED_RETURN_COLUMNS if column not in df.columns]
+    return_columns = {column for column in df.columns if column.endswith("_return")}
+    missing = [column for column in REQUIRED_RETURN_COLUMNS if column not in return_columns]
     if missing:
         raise ValueError(f"Missing required return columns: {missing}")
 
@@ -95,13 +96,14 @@ def _generate_ml_features(
     max_lag: int,
     include_rolling: bool = True,
 ) -> pd.DataFrame:
-    """Generate lag/rolling predictors for tabular ML models."""
+    """Generate lag/rolling predictors only for *_return columns."""
     if max_lag < 1:
         raise ValueError("max_lag must be >= 1")
 
     features = returns_df.copy()
+    return_columns = [column for column in returns_df.columns if column.endswith("_return")]
 
-    for col in returns_df.columns:
+    for col in return_columns:
         for lag in range(1, max_lag + 1):
             features[f"{col}_lag{lag}"] = returns_df[col].shift(lag)
 
@@ -167,8 +169,9 @@ def save_shifted_targets(
     returns_df: pd.DataFrame,
     horizons: Iterable[int],
     output_dir: str | Path,
+    valid_index: pd.Index,
 ) -> dict[int, pd.Series]:
-    """Save cumulative Brent log-return targets for multiple horizons."""
+    """Save cumulative Brent log-return targets aligned to valid_index."""
     _validate_returns_columns(returns_df)
 
     unique_horizons = sorted({int(h) for h in horizons})
@@ -183,6 +186,7 @@ def save_shifted_targets(
     targets: dict[int, pd.Series] = {}
     for horizon in unique_horizons:
         target = _compute_cumulative_target(returns_df, horizon=horizon).dropna()
+        target = target.reindex(valid_index)
         target_path = output_path / f"target_h{horizon}.parquet"
         target.to_frame(name=f"target_h{horizon}").to_parquet(target_path)
         targets[horizon] = target
@@ -313,6 +317,7 @@ def run_feature_pipeline(
             returns_df=full_returns,
             horizons=extra_horizons,
             output_dir=output_dir,
+            valid_index=X_ml.index,
         )
         if extra_horizons
         else {}
