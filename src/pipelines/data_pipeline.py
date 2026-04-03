@@ -199,35 +199,48 @@ def run_stationarity_diagnostics(returns_df: pd.DataFrame) -> dict[str, dict[str
     return diagnostics
 
 
-def create_train_val_test_split(returns_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Split the returns data into train, validation, and test sets.
-
-    Args:
-        returns_df: DataFrame of log returns.
-
-    Returns:
-        Dictionary with keys train, val, test.
-    """
-    train = returns_df.loc["2007-07-30":"2021-12-31"].copy()
-    val = returns_df.loc["2022-01-01":"2023-12-31"].copy()
-    test = returns_df.loc["2024-01-01":"2026-03-10"].copy()
+def _split_by_fixed_dates(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Split a DataFrame using the project-standard temporal boundaries."""
+    train = df.loc["2007-07-30":"2021-12-31"].copy()
+    val = df.loc["2022-01-01":"2023-12-31"].copy()
+    test = df.loc["2024-01-01":"2026-03-10"].copy()
 
     assert (
         train.index.intersection(test.index).empty
     ), "Train and test indices overlap; test must remain isolated."
-
     return {"train": train, "val": val, "test": test}
 
 
+def create_train_val_test_split(
+    aligned_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """Split aligned prices and returns into train/val/test partitions.
+
+    Args:
+        aligned_df: DataFrame of aligned raw prices.
+        returns_df: DataFrame of log returns.
+
+    Returns:
+        Nested dictionary with keys:
+        - "prices": {"train", "val", "test"} raw price splits
+        - "returns": {"train", "val", "test"} return splits
+    """
+    return {
+        "prices": _split_by_fixed_dates(aligned_df),
+        "returns": _split_by_fixed_dates(returns_df),
+    }
+
+
 def save_processed_data(
-    splits: dict[str, pd.DataFrame],
+    split_sets: dict[str, dict[str, pd.DataFrame]],
     diagnostics: dict[str, dict[str, Any]],
     output_dir: str | Path,
 ) -> None:
     """Save processed splits and diagnostics to disk.
 
     Args:
-        splits: Dictionary of train/val/test DataFrames.
+        split_sets: Nested dictionary with "prices" and "returns" split maps.
         diagnostics: Diagnostics report data.
         output_dir: Target directory for saved files.
 
@@ -239,10 +252,18 @@ def save_processed_data(
         output_path = PROJECT_ROOT / output_path
     output_path.mkdir(parents=True, exist_ok=True)
 
-    for split_name, split_df in splits.items():
+    return_splits = split_sets.get("returns", {})
+    price_splits = split_sets.get("prices", {})
+
+    for split_name, split_df in return_splits.items():
         split_path = output_path / f"{split_name}_returns.parquet"
         split_df.to_parquet(split_path)
-        logger.info("Saved {split} to {path}", split=split_name, path=split_path)
+        logger.info("Saved returns split {split} to {path}", split=split_name, path=split_path)
+
+    for split_name, split_df in price_splits.items():
+        split_path = output_path / f"{split_name}_prices.parquet"
+        split_df.to_parquet(split_path)
+        logger.info("Saved prices split {split} to {path}", split=split_name, path=split_path)
 
     diagnostics_path = output_path / "diagnostics_report.json"
     with diagnostics_path.open("w", encoding="utf-8") as handle:
@@ -257,10 +278,10 @@ if __name__ == "__main__":
     aligned_df = align_series(raw_df)
     returns_df = compute_log_returns(aligned_df)
     diagnostics = run_stationarity_diagnostics(returns_df)
-    splits = create_train_val_test_split(returns_df)
+    split_sets = create_train_val_test_split(aligned_df=aligned_df, returns_df=returns_df)
 
-    save_processed_data(splits, diagnostics, output_dir=DEFAULT_PROCESSED_DIR)
+    save_processed_data(split_sets, diagnostics, output_dir=DEFAULT_PROCESSED_DIR)
 
-    for split_name, split_df in splits.items():
+    for split_name, split_df in split_sets["returns"].items():
         summary = split_df.describe().T
         logger.info("Summary for {split}\n{summary}", split=split_name, summary=summary)

@@ -63,6 +63,31 @@ def _parse_prediction_name(path: Path) -> str:
     return f"{model_name}_h{horizon}"
 
 
+def validate_predictions_file(df: pd.DataFrame, path_name: str) -> bool:
+    """Validate prediction dataframe schema and integrity."""
+    if df.empty:
+        logger.error(f"Validation failed for {path_name}: DataFrame is completely empty.")
+        return False
+        
+    if not isinstance(df.index, pd.DatetimeIndex):
+        logger.error(f"Validation failed for {path_name}: Index is {type(df.index).__name__}, expected DatetimeIndex.")
+        return False
+
+    if df.index.hasnans:
+        logger.error(f"Validation failed for {path_name}: Index contains NaT values.")
+        return False
+
+    if df.columns.empty:
+        logger.error(f"Validation failed for {path_name}: No columns present.")
+        return False
+        
+    if df.isna().all().any():
+        logger.error(f"Validation failed for {path_name}: Contains entirely NaN columns.")
+        return False
+
+    return True
+
+
 def _extract_horizon_from_model_key(model_key: str) -> int:
     match = re.search(r"_h(\d+)$", model_key)
     if not match:
@@ -70,11 +95,12 @@ def _extract_horizon_from_model_key(model_key: str) -> int:
     return int(match.group(1))
 
 
-def load_all_predictions(processed_dir: str | Path) -> dict[str, pd.Series]:
+def load_all_predictions(processed_dir: str | Path, test_start: str = "2024-01-01") -> dict[str, pd.Series]:
     """Load all prediction files from the processed directory and align indices.
 
     Args:
         processed_dir: Directory containing prediction parquet files.
+        test_start: Start date for test period filtering (inclusive).
 
     Returns:
         Dictionary mapping model_horizon names to aligned prediction series.
@@ -86,29 +112,59 @@ def load_all_predictions(processed_dir: str | Path) -> dict[str, pd.Series]:
         raise FileNotFoundError(f"No predictions_*.parquet files found in {processed_path}")
 
     predictions: dict[str, pd.Series] = {}
+    excluded_files = []
 
     for file_path in files:
-        df = pd.read_parquet(file_path)
-        series = _extract_prediction_series(df)
-        key = _parse_prediction_name(file_path)
-        predictions[key] = series
+        try:
+            df = pd.read_parquet(file_path)
+            if not validate_predictions_file(df, file_path.name):
+                excluded_files.append(file_path.name)
+                continue
+                
+            # FIX: Standardize index to tz-naive
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+
+            series = _extract_prediction_series(df)
+            if series.index.tz is not None:
+                series.index = series.index.tz_localize(None)
+                
+            try:
+                filtered_series = series.loc[test_start:]
+            except KeyError:
+                filtered_series = series[series.index >= pd.Timestamp(test_start)]
+                
+            if filtered_series.empty:
+                logger.error(f"File {file_path.name} is empty after filtering by test_start={test_start}.")
+                excluded_files.append(file_path.name)
+                continue
+
+            key = _parse_prediction_name(file_path)
+            predictions[key] = filtered_series
+        except Exception as exc:
+            logger.error(f"Failed to process {file_path.name}: {exc}")
+            excluded_files.append(file_path.name)
 
     if not predictions:
-        return predictions
+        raise RuntimeError(f"All prediction files were invalid or empty. Excluded: {excluded_files}")
 
     # Знаходження спільного перетину індексів для всіх моделей
     common_index = predictions[list(predictions.keys())[0]].index
-    for series in predictions.values():
+    for key, series in predictions.items():
+        prev_len = len(common_index)
         common_index = common_index.intersection(series.index)
+        if len(common_index) == 0:
+            raise RuntimeError(f"Intersection with {key} resulted in an empty index! Prev len: {prev_len}")
 
-    if common_index.empty:
-        logger.warning("Common index across all predictions is empty.")
+    if common_index.empty or len(common_index) == 0:
+        raise RuntimeError("Common index across all predictions is empty. Halt evaluation.")
 
     # Вирівнювання всіх прогнозів за спільним індексом
     for key in predictions:
         predictions[key] = predictions[key].loc[common_index]
 
-    logger.info("Aligned all predictions to a common index of length {n}", n=len(common_index))
+    logger.info("Aligned {n_models} predictions to a common index of length {length}. Excluded: {excl}", 
+                n_models=len(predictions), length=len(common_index), excl=excluded_files)
 
     return predictions
 
@@ -151,6 +207,10 @@ def evaluate_experiment_a(
     rows: list[dict[str, Any]] = []
     for model_name, preds in predictions_dict.items():
         y_test_model, preds_model = _align_series(y_test_series, preds)
+
+        if len(y_test_model) == 0:
+            logger.warning(f"Skipping evaluate_experiment_a for {model_name}: aligned series is empty.")
+            continue
 
         mase = calculate_window_mase(train_window, y_test_model, preds_model, m=1)
         rmse = float(np.sqrt(np.mean((y_test_model - preds_model) ** 2)))
@@ -201,6 +261,11 @@ def evaluate_experiment_b(
     rows: list[dict[str, Any]] = []
     for model_name, preds in predictions_dict.items():
         y_test_model, preds_model = _align_series(y_test_series, preds)
+        
+        if len(y_test_model) == 0:
+            logger.warning("Skipping evaluate_experiment_b for {model}: aligned series is empty.", model=model_name)
+            continue
+            
         y_true = (y_test_model > 0).astype(int).to_numpy()
         y_pred = (preds_model > 0).astype(int).to_numpy()
 
@@ -237,18 +302,15 @@ def evaluate_experiment_b(
 
 
 def compare_horizons(results_h1: pd.DataFrame, results_h7: pd.DataFrame) -> pd.DataFrame:
-    """Compare metric shifts between horizons h=1 and h=7.
+    # Нормалізуємо індекс — прибираємо суфікс _h1/_h7
+    h1 = results_h1.copy()
+    h7 = results_h7.copy()
+    h1.index = h1.index.str.replace(r"_h\d+$", "", regex=True)
+    h7.index = h7.index.str.replace(r"_h\d+$", "", regex=True)
 
-    Args:
-        results_h1: Metrics for horizon 1.
-        results_h7: Metrics for horizon 7.
-
-    Returns:
-        DataFrame with side-by-side metrics and MASE delta.
-    """
-    common_models = results_h1.index.intersection(results_h7.index)
-    h1 = results_h1.loc[common_models].copy()
-    h7 = results_h7.loc[common_models].copy()
+    common_models = h1.index.intersection(h7.index)
+    h1 = h1.loc[common_models]
+    h7 = h7.loc[common_models]
 
     combined = pd.DataFrame(index=common_models)
     for col in h1.columns:
@@ -399,17 +461,19 @@ if __name__ == "__main__":
 
     if not preds_by_horizon:
         raise ValueError("No predictions with horizon suffix were found (expected *_h<k>).")
+    
+    TEST_START = "2024-01-01"
 
     def load_test_target(horizon: int) -> pd.Series:
         """Load the correctly shifted target for evaluation to prevent data leakage."""
         target_path = processed_dir / f"target_h{horizon}.parquet"
         if target_path.exists():
             df = pd.read_parquet(target_path)
-            return df.iloc[:, 0]
-        logger.warning("Target file {path} not found. Falling back to unshifted test_returns.", path=target_path)
-        test_path = processed_dir / "test_returns.parquet"
-        df = pd.read_parquet(test_path)
-        return df["brent_return"] if "brent_return" in df.columns else df.iloc[:, 0]
+            return df.iloc[:, 0].loc[TEST_START:]
+            
+        raise FileNotFoundError(
+            f"Target file {target_path} not found. Ensure pipeline generates shifted targets to avoid evaluating against h=1."
+        )
 
     config_path = Path("configs") / "wfv_config.json"
     w_train = 1000

@@ -147,13 +147,17 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         return self
 
-    def _predict_df(self, X_test: pd.DataFrame) -> pd.DataFrame:
+    def _predict_df(self, X_test: pd.DataFrame, history_X: pd.DataFrame | None = None, history_y: pd.Series | None = None) -> pd.DataFrame:
         if self._nf is None:
             raise ValueError("Model must be fitted before prediction")
 
         futr_df = self._build_future_df(X_test)
+        
+        hist_df = None
+        if history_X is not None and history_y is not None:
+             hist_df = self._prepare_df(history_X, history_y)
 
-        forecast_df = self._predict_with_futr_df(futr_df)
+        forecast_df = self._predict_with_futr_df(futr_df, hist_df)
         forecast_df = self._normalize_forecast_df(forecast_df, futr_df)
 
         if len(forecast_df) != len(futr_df):
@@ -245,14 +249,20 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         return futr_df
 
-    def _predict_with_futr_df(self, futr_df: pd.DataFrame) -> pd.DataFrame:
+    def _predict_with_futr_df(self, futr_df: pd.DataFrame, hist_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        kwargs = {}
+        if futr_df is not None:
+            kwargs["futr_df"] = futr_df
+        if hist_df is not None:
+            kwargs["df"] = hist_df
+
         try:
-            forecast_df = self._nf.predict(futr_df=futr_df)
+            forecast_df = self._nf.predict(**kwargs)
         except TypeError:
-            try:
-                forecast_df = self._nf.predict(df=futr_df)
-            except Exception:
-                forecast_df = self._nf.predict()
+            # Fallback if futr_df is not accepted
+            if "futr_df" in kwargs:
+                del kwargs["futr_df"]
+            forecast_df = self._nf.predict(**kwargs)
         return forecast_df
 
     @staticmethod
@@ -332,8 +342,8 @@ class DeepLearningForecasterWrapper(BaseForecaster):
                 return candidate
         return columns[0]
 
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        forecast_df = self._predict_df(X)
+    def predict(self, X: pd.DataFrame, history_X: pd.DataFrame | None = None, history_y: pd.Series | None = None) -> np.ndarray:
+        forecast_df = self._predict_df(X, history_X, history_y)
 
         exclude = {"unique_id", "ds"}
         model_cols = [c for c in forecast_df.columns if c not in exclude]

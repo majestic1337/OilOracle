@@ -38,11 +38,13 @@ class BaseForecaster(BaseEstimator, RegressorMixin):
         """
         raise NotImplementedError("fit must be implemented in subclasses")
 
-    def predict(self, X: Any) -> np.ndarray:
+    def predict(self, X: Any, history_X: Any | None = None, history_y: Any | None = None) -> np.ndarray:
         """Generate point forecasts.
 
         Args:
             X: Feature matrix for prediction.
+            history_X: Optional historical features for models that require state update without fitting.
+            history_y: Optional historical targets for models that require state update without fitting.
 
         Returns:
             Array of point forecasts.
@@ -62,12 +64,30 @@ class BaseForecaster(BaseEstimator, RegressorMixin):
         raise NotImplementedError("predict_interval not supported for this model")
 
 
-def _to_numpy(values: Any) -> np.ndarray:
-    """Convert array-like values to a 1D numpy array."""
+def as_1d_array(values: Any) -> np.ndarray:
+    """Convert array-like values to a 1D numpy float array.
+
+    Shared utility — import from here instead of duplicating.
+    """
     array = np.asarray(values, dtype=float)
     if array.ndim > 1:
         array = array.squeeze()
     return array
+
+
+def as_2d_array(values: Any) -> np.ndarray:
+    """Convert array-like values to a 2D numpy float array.
+
+    Shared utility — import from here instead of duplicating.
+    """
+    array = np.asarray(values, dtype=float)
+    if array.ndim == 1:
+        return array.reshape(-1, 1)
+    return array
+
+
+# Backward-compat alias
+_to_numpy = as_1d_array
 
 
 def calculate_window_mase(
@@ -95,9 +115,9 @@ def calculate_window_mase(
     if m < 1:
         raise ValueError("m must be >= 1")
 
-    train = _to_numpy(y_train)
-    test = _to_numpy(y_test)
-    pred = _to_numpy(y_pred)
+    train = as_1d_array(y_train)
+    test = as_1d_array(y_test)
+    pred = as_1d_array(y_pred)
 
     if len(test) != len(pred):
         raise ValueError("y_test and y_pred must have the same length")
@@ -117,6 +137,10 @@ def calculate_window_mase(
         logger.warning("Naive MAE is zero; MASE undefined")
         return float("nan")
 
+    if len(test) == 0:
+        logger.warning("y_test is empty; MASE undefined")
+        return float("nan")
+
     forecast_mae = float(np.mean(np.abs(test - pred)))
     return forecast_mae / naive_mae
 
@@ -134,9 +158,9 @@ def calculate_metrics(y_train: Any, y_test: Any, y_pred: Any) -> dict[str, float
     Returns:
         Dictionary of metrics.
     """
-    train = _to_numpy(y_train)
-    test = _to_numpy(y_test)
-    pred = _to_numpy(y_pred)
+    train = as_1d_array(y_train)
+    test = as_1d_array(y_test)
+    pred = as_1d_array(y_pred)
 
     if len(test) != len(pred):
         raise ValueError("y_test and y_pred must have the same length")
@@ -170,8 +194,8 @@ def diebold_mariano_test(
     if h < 1:
         raise ValueError("h must be >= 1")
 
-    err_model = _to_numpy(errors_model)
-    err_bench = _to_numpy(errors_benchmark)
+    err_model = as_1d_array(errors_model)
+    err_bench = as_1d_array(errors_benchmark)
 
     if len(err_model) != len(err_bench):
         raise ValueError("errors_model and errors_benchmark must have the same length")

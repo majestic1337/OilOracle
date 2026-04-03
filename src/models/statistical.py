@@ -7,16 +7,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from loguru import logger
+from scipy.stats import norm
 from sklearn.linear_model import LinearRegression
 
-from .base import BaseForecaster
-
-
-def _as_1d_array(values: Any) -> np.ndarray:
-    array = np.asarray(values, dtype=float)
-    if array.ndim > 1:
-        array = array.squeeze()
-    return array
+from .base import BaseForecaster, as_1d_array
 
 
 def _first_column_series(X: Any) -> np.ndarray:
@@ -36,8 +30,9 @@ class RandomWalkModel(BaseForecaster):
     (price remains unchanged). Prediction intervals are based on recent historical volatility.
     """
 
-    def __init__(self, window: int = 20) -> None:
+    def __init__(self, window: int = 20, task_type: str = "regression") -> None:
         self.window = window
+        self.task_type = task_type
         self._expected_return: float = 0.0
         self._rolling_std: float | None = None
         self._logger = logger.bind(model=self.__class__.__name__)
@@ -56,7 +51,8 @@ class RandomWalkModel(BaseForecaster):
         if series.size == 0:
             raise ValueError("y_train is empty; cannot fit RandomWalkModel")
 
-        self._expected_return = float(np.mean(series))
+        # True random walk on stationary log-returns: naive forecast is zero.
+        self._expected_return = 0.0
         
         window = min(self.window, len(series))
         if window < 2:
@@ -75,7 +71,7 @@ class RandomWalkModel(BaseForecaster):
         steps = len(X) if hasattr(X, "__len__") else 1
         std = float(self._rolling_std) if self._rolling_std is not None else float("nan")
         
-        z = 1.96
+        z = float(norm.ppf(1.0 - alpha / 2.0))
         
         lower = np.full(steps, self._expected_return - z * std, dtype=float)
         upper = np.full(steps, self._expected_return + z * std, dtype=float)
@@ -90,7 +86,8 @@ class DLinearModel(BaseForecaster):
     transparent baseline that is easy to interpret and compare.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, task_type: str = "regression") -> None:
+        self.task_type = task_type
         self.model = LinearRegression()
         self._residual_std: float | None = None
         self._logger = logger.bind(model=self.__class__.__name__)
@@ -104,7 +101,13 @@ class DLinearModel(BaseForecaster):
     ) -> "DLinearModel":
         """Fit the linear regression and cache residual volatility."""
         X_arr = np.asarray(X_train)
-        y_arr = _as_1d_array(y_train)
+        y_arr = as_1d_array(y_train)
+
+        if X_val is not None and y_val is not None:
+            X_val_arr = np.asarray(X_val)
+            y_val_arr = as_1d_array(y_val)
+            X_arr = np.concatenate([X_arr, X_val_arr], axis=0)
+            y_arr = np.concatenate([y_arr, y_val_arr], axis=0)
 
         self.model.fit(X_arr, y_arr)
         residuals = y_arr - self.model.predict(X_arr)
@@ -124,7 +127,7 @@ class DLinearModel(BaseForecaster):
         """Return symmetric intervals based on training residual variance."""
         preds = self.predict(X)
         std = float(self._residual_std) if self._residual_std is not None else float("nan")
-        z = 1.96
+        z = float(norm.ppf(1.0 - alpha / 2.0))
         lower = preds - z * std
         upper = preds + z * std
         return lower, upper
@@ -139,15 +142,24 @@ class ARIMAGARCHModel(BaseForecaster):
     conditional variance (GARCH) to emulate classic commodity return models.
     """
 
-    def __init__(self, max_p: int = 5, max_q: int = 2, random_state: int = 42) -> None:
+    def __init__(
+        self,
+        max_p: int = 5,
+        max_q: int = 2,
+        random_state: int = 42,
+        horizon: int = 1,
+        task_type: str = "regression",
+    ) -> None:
         self.max_p = max_p
         self.max_q = max_q
         self.random_state = random_state
+        self._horizon = horizon
+        self.task_type = task_type
         self.arima_model: Any | None = None
         self.garch_model: Any | None = None
         self.garch_scale_: float = 1.0
         self._fit_success = False
-        self._fallback = RandomWalkModel()
+        self._fallback = RandomWalkModel(task_type=task_type)
         self._logger = logger.bind(model=self.__class__.__name__)
 
     def fit(
@@ -163,11 +175,26 @@ class ARIMAGARCHModel(BaseForecaster):
         If the ARIMA or GARCH fails to converge, we degrade gracefully to a
         random-walk forecast while preserving the model interface.
         """
-        series = np.asarray(y_train, dtype=float).squeeze()
+        X_fit = X_train
+        y_fit = y_train
+        if X_val is not None and y_val is not None:
+            if isinstance(X_train, pd.DataFrame) and isinstance(X_val, pd.DataFrame):
+                X_fit = pd.concat([X_train, X_val], axis=0).sort_index()
+            else:
+                X_fit = np.concatenate([np.asarray(X_train), np.asarray(X_val)], axis=0)
+
+            if isinstance(y_train, pd.Series) and isinstance(y_val, pd.Series):
+                y_fit = pd.concat([y_train, y_val], axis=0).sort_index()
+            elif isinstance(y_train, pd.DataFrame) and isinstance(y_val, pd.DataFrame):
+                y_fit = pd.concat([y_train, y_val], axis=0).sort_index()
+            else:
+                y_fit = np.concatenate([as_1d_array(y_train), as_1d_array(y_val)], axis=0)
+
+        series = np.asarray(y_fit, dtype=float).squeeze()
         if series.size == 0:
             raise ValueError("X_train is empty; cannot fit ARIMAGARCHModel")
 
-        self._fallback.fit(X_train, y_train)
+        self._fallback.fit(X_fit, y_fit)
 
         try:
             from pmdarima import auto_arima
@@ -249,13 +276,25 @@ class ARIMAGARCHModel(BaseForecaster):
         return variance_array[-1]
 
     def predict(self, X: Any) -> np.ndarray:
-        """Forecast conditional mean; fallback to RandomWalk on failure."""
+        """Forecast conditional mean; fallback to RandomWalk on failure.
+
+        In direct-forecasting mode with horizon h and test length n:
+        1) forecast total_steps = (h - 1) + n
+        2) drop the first (h - 1) embargo steps
+        3) keep the last n values aligned with X_test indices
+        """
         steps = len(X) if hasattr(X, "__len__") else 1
         if not self._fit_success:
             return self._fallback.predict(X)
 
         try:
-            return self._forecast_mean(steps)
+            total_steps = max((self._horizon - 1) + steps, 1)
+            mean_forecast = self._forecast_mean(total_steps)
+            if mean_forecast.size < steps:
+                if mean_forecast.size == 0:
+                    return np.full(steps, np.nan, dtype=float)
+                return np.pad(mean_forecast, (0, steps - mean_forecast.size), mode="edge")
+            return mean_forecast[-steps:].astype(float)
         except Exception as exc:  # noqa: BLE001 - robust fallback
             self._logger.warning(
                 "ARIMA predict failed; fallback to RandomWalk: {error}",
@@ -274,8 +313,9 @@ class ARIMAGARCHModel(BaseForecaster):
             return self._fallback.predict_interval(X, alpha=alpha)
 
         try:
-            mean = self._forecast_mean(steps)
-            variance = self._forecast_variance(steps)
+            total_steps = max((self._horizon - 1) + steps, 1)
+            mean = self._forecast_mean(total_steps)
+            variance = self._forecast_variance(total_steps)
         except Exception as exc:  # noqa: BLE001 - robust fallback
             self._logger.warning(
                 "GARCH interval failed; fallback to RandomWalk: {error}",
@@ -283,9 +323,25 @@ class ARIMAGARCHModel(BaseForecaster):
             )
             return self._fallback.predict_interval(X, alpha=alpha)
 
-        z = 1.96
+        z = float(norm.ppf(1.0 - alpha / 2.0))
         garch_scale = self.garch_scale_ if self.garch_scale_ else 1.0
         std = np.sqrt(variance) / garch_scale
+        if mean.size < steps:
+            if mean.size == 0:
+                mean = np.full(steps, np.nan, dtype=float)
+            else:
+                mean = np.pad(mean, (0, steps - mean.size), mode="edge")
+        else:
+            mean = mean[-steps:]
+
+        if std.size < steps:
+            if std.size == 0:
+                std = np.full(steps, np.nan, dtype=float)
+            else:
+                std = np.pad(std, (0, steps - std.size), mode="edge")
+        else:
+            std = std[-steps:]
+
         lower = mean - z * std
         upper = mean + z * std
-        return lower.astype(float), upper.astype(float)
+        return lower, upper

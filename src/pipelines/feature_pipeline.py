@@ -18,6 +18,7 @@ REQUIRED_RETURN_COLUMNS: tuple[str, ...] = (
     "dxy_return",
     "gold_return",
 )
+REQUIRED_DL_PRICE_COLUMNS: tuple[str, ...] = ("brent",)
 LAG_AIC_CACHE: dict[int, float] = {}
 DEFAULT_HORIZONS: tuple[int, ...] = (1, 3, 5, 7)
 
@@ -27,6 +28,27 @@ def _validate_returns_columns(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"Missing required return columns: {missing}")
 
+
+def _validate_dl_price_columns(df: pd.DataFrame) -> None:
+    missing = [column for column in REQUIRED_DL_PRICE_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required price columns for DL: {missing}")
+
+
+def _compute_cumulative_target(returns_df: pd.DataFrame, horizon: int) -> pd.Series:
+    """Build cumulative log-return target over horizon h."""
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+
+    _validate_returns_columns(returns_df)
+    target = (
+        returns_df["brent_return"]
+        .rolling(window=horizon, min_periods=horizon)
+        .sum()
+        .shift(-horizon)
+        .rename(f"target_h{horizon}")
+    )
+    return target
 
 
 def _compute_aic_by_lag(train_df: pd.DataFrame, max_search: int) -> dict[int, float]:
@@ -54,7 +76,6 @@ def _compute_aic_by_lag(train_df: pd.DataFrame, max_search: int) -> dict[int, fl
     return aic_values
 
 
-
 def determine_max_lag_order(train_df: pd.DataFrame, max_search: int = 5) -> int:
     """Determine optimal lag order using AIC on the training segment."""
     global LAG_AIC_CACHE
@@ -67,7 +88,6 @@ def determine_max_lag_order(train_df: pd.DataFrame, max_search: int = 5) -> int:
         aic=LAG_AIC_CACHE[best_lag],
     )
     return best_lag
-
 
 
 def _generate_ml_features(
@@ -98,7 +118,6 @@ def _generate_ml_features(
     return features
 
 
-
 def prepare_ml_data(
     returns_df: pd.DataFrame,
     max_lag: int,
@@ -106,17 +125,14 @@ def prepare_ml_data(
     output_dir: str | Path,
     include_rolling: bool = True,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Prepare ML-ready feature matrix with shifted target.
+    """Prepare ML-ready feature matrix with cumulative log-return target.
 
     Steps:
     1) Build lag/rolling predictors.
-    2) Shift target by -horizon for direct forecasting.
+    2) Compute cumulative log-return target over horizon h.
     3) Drop all rows containing NaN.
     4) Save `feature_matrix_ml.parquet` and `target_h{horizon}.parquet`.
     """
-    if horizon < 1:
-        raise ValueError("horizon must be >= 1")
-
     _validate_returns_columns(returns_df)
 
     features = _generate_ml_features(
@@ -124,7 +140,7 @@ def prepare_ml_data(
         max_lag=max_lag,
         include_rolling=include_rolling,
     )
-    target = returns_df["brent_return"].shift(-horizon).rename(f"target_h{horizon}")
+    target = _compute_cumulative_target(returns_df, horizon=horizon)
 
     joined = pd.concat([features, target], axis=1).dropna(how="any")
     feature_cols = [column for column in joined.columns if column != target.name]
@@ -152,7 +168,7 @@ def save_shifted_targets(
     horizons: Iterable[int],
     output_dir: str | Path,
 ) -> dict[int, pd.Series]:
-    """Save shifted Brent targets for multiple direct-forecast horizons."""
+    """Save cumulative Brent log-return targets for multiple horizons."""
     _validate_returns_columns(returns_df)
 
     unique_horizons = sorted({int(h) for h in horizons})
@@ -166,37 +182,52 @@ def save_shifted_targets(
 
     targets: dict[int, pd.Series] = {}
     for horizon in unique_horizons:
-        target = returns_df["brent_return"].shift(-horizon).rename(f"target_h{horizon}").dropna()
+        target = _compute_cumulative_target(returns_df, horizon=horizon).dropna()
         target_path = output_path / f"target_h{horizon}.parquet"
         target.to_frame(name=f"target_h{horizon}").to_parquet(target_path)
         targets[horizon] = target
-        logger.info("Saved shifted target for horizon h={h} to {path}", h=horizon, path=target_path)
+        logger.info(
+            "Saved cumulative target for horizon h={h} to {path}",
+            h=horizon,
+            path=target_path,
+        )
 
     return targets
 
 
-
 def prepare_dl_data(
+    prices_df: pd.DataFrame,
     returns_df: pd.DataFrame,
     output_dir: str | Path,
 ) -> pd.DataFrame:
     """Prepare DL-ready data for NeuralForecast.
 
-    No lag generation, no rolling windows, and no target shift are applied.
+    Target y is sourced from raw Brent prices, while exogenous regressors come
+    from return-space series.
     Output schema: [unique_id, ds, y, wti_return, dxy_return, gold_return].
     """
+    _validate_dl_price_columns(prices_df)
     _validate_returns_columns(returns_df)
+
+    common_index = pd.DatetimeIndex(prices_df.index).intersection(
+        pd.DatetimeIndex(returns_df.index)
+    )
+    if common_index.empty:
+        raise ValueError("No overlapping index between prices_df and returns_df")
+
+    prices_aligned = prices_df.loc[common_index].sort_index()
+    returns_aligned = returns_df.loc[common_index].sort_index()
 
     dl_df = pd.DataFrame(
         {
             "unique_id": "brent",
-            "ds": pd.DatetimeIndex(returns_df.index),
-            "y": returns_df["brent_return"],
-            "wti_return": returns_df["wti_return"],
-            "dxy_return": returns_df["dxy_return"],
-            "gold_return": returns_df["gold_return"],
+            "ds": pd.DatetimeIndex(common_index),
+            "y": prices_aligned["brent"],
+            "wti_return": returns_aligned["wti_return"],
+            "dxy_return": returns_aligned["dxy_return"],
+            "gold_return": returns_aligned["gold_return"],
         },
-        index=returns_df.index,
+        index=common_index,
     )
 
     dl_df = dl_df.dropna(how="any")
@@ -208,7 +239,6 @@ def prepare_dl_data(
 
     logger.info("Saved DL feature matrix to {path}", path=dl_path)
     return dl_df
-
 
 
 def save_lag_config(
@@ -235,26 +265,37 @@ def save_lag_config(
     return payload
 
 
-
 def run_feature_pipeline(
     processed_dir: str | Path = "data/processed",
     horizon: int = 1,
     horizons: tuple[int, ...] = DEFAULT_HORIZONS,
     max_search: int = 5,
-) -> dict[str, pd.DataFrame | pd.Series]:
+) -> dict[str, Any]:
     """Run both ML and DL feature preparation branches."""
     output_dir = Path(processed_dir)
-    train_df = pd.read_parquet(output_dir / "train_returns.parquet")
-    val_df = pd.read_parquet(output_dir / "val_returns.parquet")
-    test_df = pd.read_parquet(output_dir / "test_returns.parquet")
+    train_returns = pd.read_parquet(output_dir / "train_returns.parquet")
+    val_returns = pd.read_parquet(output_dir / "val_returns.parquet")
+    test_returns = pd.read_parquet(output_dir / "test_returns.parquet")
 
-    full_returns = pd.concat([train_df, val_df, test_df]).sort_index()
+    train_prices = pd.read_parquet(output_dir / "train_prices.parquet")
+    val_prices = pd.read_parquet(output_dir / "val_prices.parquet")
+    test_prices = pd.read_parquet(output_dir / "test_prices.parquet")
 
-    max_lag_order = determine_max_lag_order(train_df, max_search=max_search)
+    full_returns = pd.concat([train_returns, val_returns, test_returns]).sort_index()
+    full_prices = pd.concat([train_prices, val_prices, test_prices]).sort_index()
+
+    common_index = full_returns.index.intersection(full_prices.index)
+    if common_index.empty:
+        raise ValueError("No overlapping index between full_returns and full_prices")
+
+    full_returns = full_returns.loc[common_index].sort_index()
+    full_prices = full_prices.loc[common_index].sort_index()
+
+    max_lag_order = determine_max_lag_order(train_returns, max_search=max_search)
     save_lag_config(
         max_lag_order=max_lag_order,
         max_search=max_search,
-        train_end_date=str(train_df.index.max().date()),
+        train_end_date=str(train_returns.index.max().date()),
     )
 
     all_horizons = tuple(sorted(set(horizons + (horizon,))))
@@ -276,7 +317,11 @@ def run_feature_pipeline(
         if extra_horizons
         else {}
     )
-    dl_df = prepare_dl_data(returns_df=full_returns, output_dir=output_dir)
+    dl_df = prepare_dl_data(
+        prices_df=full_prices,
+        returns_df=full_returns,
+        output_dir=output_dir,
+    )
 
     logger.info("ML matrix shape: {shape}", shape=X_ml.shape)
     logger.info("DL matrix shape: {shape}", shape=dl_df.shape)

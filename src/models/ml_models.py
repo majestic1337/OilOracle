@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from src.models.base import BaseForecaster, calculate_metrics
+from src.models.base import BaseForecaster, as_1d_array, as_2d_array, calculate_metrics
 
 __all__ = [
     "XGBoostForecaster",
@@ -18,27 +18,16 @@ __all__ = [
 ]
 
 
-def _as_2d_array(values: Any) -> np.ndarray:
-    array = np.asarray(values, dtype=float)
-    if array.ndim == 1:
-        return array.reshape(-1, 1)
-    return array
-
-
-def _as_1d_array(values: Any) -> np.ndarray:
-    array = np.asarray(values, dtype=float)
-    if array.ndim > 1:
-        array = array.squeeze()
-    return array
 
 
 class XGBoostForecaster(BaseForecaster):
-    def __init__(self, random_state: int = 42) -> None:
+    def __init__(self, random_state: int = 42, alpha: float = 0.1) -> None:
         self.random_state = random_state
+        self.alpha = alpha
         self._logger = logger.bind(model=self.__class__.__name__)
-        self.model_q10: Any | None = None
+        self.model_lower: Any | None = None
         self.model_q50: Any | None = None
-        self.model_q90: Any | None = None
+        self.model_upper: Any | None = None
         self.feature_names_: list[str] | None = None
 
     def _build_model(self, quantile: float) -> Any:
@@ -72,26 +61,40 @@ class XGBoostForecaster(BaseForecaster):
         y_val: Any | None = None,
     ) -> "XGBoostForecaster":
         self.feature_names_ = X_train.columns.tolist() if hasattr(X_train, "columns") else None
-        X_arr = _as_2d_array(X_train)
-        y_arr = _as_1d_array(y_train)
+        X_arr = as_2d_array(X_train)
+        y_arr = as_1d_array(y_train)
 
         if X_val is None or y_val is None:
+            # H8: Use last 10% as temporal validation (not random split)
             split_idx = int(len(X_arr) * 0.9)
-            X_t, y_t = X_arr[:split_idx], y_arr[:split_idx]
-            X_v, y_v = X_arr[split_idx:], y_arr[split_idx:]
+            if split_idx < 1 or split_idx >= len(X_arr):
+                self._logger.warning(
+                    "Dataset too small for internal temporal split; using full set"
+                )
+                X_t, y_t = X_arr, y_arr
+                X_v, y_v = X_arr[-1:], y_arr[-1:]
+            else:
+                self._logger.info(
+                    "No validation data provided; using last 10%% as temporal hold-out"
+                )
+                X_t, y_t = X_arr[:split_idx], y_arr[:split_idx]
+                X_v, y_v = X_arr[split_idx:], y_arr[split_idx:]
         else:
             X_t, y_t = X_arr, y_arr
-            X_v, y_v = _as_2d_array(X_val), _as_1d_array(y_val)
+            X_v, y_v = as_2d_array(X_val), as_1d_array(y_val)
 
-        self.model_q10 = self._build_model(0.1)
+        lower_q = self.alpha / 2.0
+        upper_q = 1.0 - self.alpha / 2.0
+
+        self.model_lower = self._build_model(lower_q)
         self.model_q50 = self._build_model(0.5)
-        self.model_q90 = self._build_model(0.9)
+        self.model_upper = self._build_model(upper_q)
 
         eval_set = [(X_v, y_v)]
         
-        self.model_q10.fit(X_t, y_t, eval_set=eval_set, verbose=False)
+        self.model_lower.fit(X_t, y_t, eval_set=eval_set, verbose=False)
         self.model_q50.fit(X_t, y_t, eval_set=eval_set, verbose=False)
-        self.model_q90.fit(X_t, y_t, eval_set=eval_set, verbose=False)
+        self.model_upper.fit(X_t, y_t, eval_set=eval_set, verbose=False)
 
         return self
 
@@ -103,24 +106,25 @@ class XGBoostForecaster(BaseForecaster):
         if not isinstance(X_input, pd.DataFrame) and self.feature_names_:
             X_input = pd.DataFrame(X_input, columns=self.feature_names_)
             
-        return self.model_q50.predict(_as_2d_array(X_input)).astype(float)
+        return self.model_q50.predict(as_2d_array(X_input)).astype(float)
 
     def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
-        if self.model_q10 is None or self.model_q90 is None:
+        if self.model_lower is None or self.model_upper is None:
             raise ValueError("XGBoostForecaster must be fitted before interval prediction")
             
-        X_arr = _as_2d_array(X)
-        lower = self.model_q10.predict(X_arr).astype(float)
-        upper = self.model_q90.predict(X_arr).astype(float)
+        X_arr = as_2d_array(X)
+        lower = self.model_lower.predict(X_arr).astype(float)
+        upper = self.model_upper.predict(X_arr).astype(float)
         return lower, upper
 
 class LightGBMForecaster(BaseForecaster):
-    def __init__(self, random_state: int = 42) -> None:
+    def __init__(self, random_state: int = 42, alpha: float = 0.1) -> None:
         self.random_state = random_state
+        self.alpha = alpha
         self._logger = logger.bind(model=self.__class__.__name__)
-        self.model_q10: Any | None = None
+        self.model_lower: Any | None = None
         self.model_q50: Any | None = None
-        self.model_q90: Any | None = None
+        self.model_upper: Any | None = None
         self.feature_names_: list[str] | None = None
 
     def _build_model(self, quantile: float) -> Any:
@@ -152,30 +156,39 @@ class LightGBMForecaster(BaseForecaster):
         y_val: Any | None = None,
     ) -> "LightGBMForecaster":
         self.feature_names_ = X_train.columns.tolist() if hasattr(X_train, "columns") else None
-        X_arr = _as_2d_array(X_train)
-        y_arr = _as_1d_array(y_train)
+        X_arr = as_2d_array(X_train)
+        y_arr = as_1d_array(y_train)
 
-        self.model_q10 = self._build_model(0.1)
+        lower_q = self.alpha / 2.0
+        upper_q = 1.0 - self.alpha / 2.0
+
+        self.model_lower = self._build_model(lower_q)
         self.model_q50 = self._build_model(0.5)
-        self.model_q90 = self._build_model(0.9)
+        self.model_upper = self._build_model(upper_q)
 
-        self.model_q10.fit(X_arr, y_arr)
-        self.model_q90.fit(X_arr, y_arr)
-
+        # C3: Apply early stopping to ALL quantile models consistently
         if X_val is not None and y_val is not None:
-            X_v, y_v = _as_2d_array(X_val), _as_1d_array(y_val)
+            X_v, y_v = as_2d_array(X_val), as_1d_array(y_val)
             try:
                 from lightgbm import early_stopping, log_evaluation
+                es_callbacks = [early_stopping(50), log_evaluation(0)]
+                self.model_lower.fit(
+                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=es_callbacks
+                )
                 self.model_q50.fit(
-                    X_arr,
-                    y_arr,
-                    eval_set=[(X_v, y_v)],
-                    callbacks=[early_stopping(50), log_evaluation(0)],
+                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=es_callbacks
+                )
+                self.model_upper.fit(
+                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=es_callbacks
                 )
             except (ImportError, Exception):
+                self.model_lower.fit(X_arr, y_arr)
                 self.model_q50.fit(X_arr, y_arr)
+                self.model_upper.fit(X_arr, y_arr)
         else:
+            self.model_lower.fit(X_arr, y_arr)
             self.model_q50.fit(X_arr, y_arr)
+            self.model_upper.fit(X_arr, y_arr)
 
         return self
 
@@ -190,12 +203,12 @@ class LightGBMForecaster(BaseForecaster):
         return self.model_q50.predict(X_input).astype(float)
 
     def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
-        if self.model_q10 is None or self.model_q90 is None:
+        if self.model_lower is None or self.model_upper is None:
             raise ValueError("Interval models not fitted")
             
-        X_arr = _as_2d_array(X)
-        lower = self.model_q10.predict(X_arr).astype(float)
-        upper = self.model_q90.predict(X_arr).astype(float)
+        X_arr = as_2d_array(X)
+        lower = self.model_lower.predict(X_arr).astype(float)
+        upper = self.model_upper.predict(X_arr).astype(float)
         return lower, upper
 
 class AdaptiveConformalWrapper(BaseForecaster):
@@ -235,8 +248,8 @@ class AdaptiveConformalWrapper(BaseForecaster):
             y_cal: Calibration targets.
             y_pred_cal: Point predictions for calibration targets.
         """
-        y_cal_arr = _as_1d_array(y_cal)
-        y_pred_arr = _as_1d_array(y_pred_cal)
+        y_cal_arr = as_1d_array(y_cal)
+        y_pred_arr = as_1d_array(y_pred_cal)
         if y_cal_arr.size == 0:
             raise ValueError("Calibration targets are empty")
         if y_cal_arr.shape != y_pred_arr.shape:
@@ -264,7 +277,7 @@ class AdaptiveConformalWrapper(BaseForecaster):
         if alpha != self.alpha:
             self._logger.warning("Ignoring alpha override; using alpha={alpha}", alpha=self.alpha)
 
-        preds = _as_1d_array(self.base_model.predict(X))
+        preds = as_1d_array(self.base_model.predict(X))
         self._last_predictions = preds
         lower = preds - self.q_hat
         upper = preds + self.q_hat
@@ -285,13 +298,14 @@ class AdaptiveConformalWrapper(BaseForecaster):
                 raise ValueError("No stored predictions; provide y_pred explicitly")
             y_pred_arr = self._last_predictions
         else:
-            y_pred_arr = _as_1d_array(y_pred)
+            y_pred_arr = as_1d_array(y_pred)
 
-        y_true_arr = _as_1d_array(y_true)
+        y_true_arr = as_1d_array(y_true)
         if y_true_arr.shape != y_pred_arr.shape:
             raise ValueError("y_true and y_pred must have the same shape")
 
+        # C4: Correct ACI update (Gibbs & Candès, 2021).
+        # q̂_{t+1} = q̂_t + γ(α − 𝟙{|e_t| > q̂_t})
         for err in np.abs(y_true_arr - y_pred_arr):
             indicator = 1.0 if err > self.q_hat else 0.0
-            alpha_t = self.alpha + self.gamma * (self.alpha - indicator)
-            self.q_hat = self.q_hat + self.gamma * (alpha_t - self.alpha)
+            self.q_hat = self.q_hat + self.gamma * (self.alpha - indicator)

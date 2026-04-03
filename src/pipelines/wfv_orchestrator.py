@@ -16,6 +16,7 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tsa.stattools import grangercausalitytests
 
 ModelFamily = Literal["ml", "dl", "stat"]
+TaskType = Literal["regression", "classification"]
 
 
 @dataclass(slots=True)
@@ -28,6 +29,7 @@ class WFVConfig:
     horizon: int = 1
     strategy: str = "direct"
     model_family: ModelFamily = "ml"
+    task_type: TaskType = "regression"
     window_type: str = "rolling"
     max_lag_order: int = 10
     granger_p_threshold: float = 0.1
@@ -43,6 +45,8 @@ class WFVConfig:
     def __post_init__(self) -> None:
         if self.model_family not in {"ml", "dl", "stat"}:
             raise ValueError("model_family must be one of {'ml', 'dl', 'stat'}")
+        if self.task_type not in {"regression", "classification"}:
+            raise ValueError("task_type must be 'regression' or 'classification'")
 
     @property
     def model_kwargs(self) -> dict[str, int]:
@@ -71,9 +75,7 @@ class WFVIteration:
     fit_time_seconds: float
 
 
-
 def _ensure_series(y: pd.Series | pd.DataFrame, horizon: int) -> pd.Series:
-    """Ensure a 1D target series for the configured horizon."""
     if isinstance(y, pd.Series):
         return y
 
@@ -84,12 +86,8 @@ def _ensure_series(y: pd.Series | pd.DataFrame, horizon: int) -> pd.Series:
         if candidate in y.columns:
             return y[candidate]
 
-    logger.warning(
-        "Unable to identify target column for horizon {h}; using first column",
-        h=horizon,
-    )
+    logger.warning("Unable to identify target column for horizon {h}; using first column", h=horizon)
     return y.iloc[:, 0]
-
 
 
 def _is_incompatible_model_error(error: Exception, horizon: int) -> bool:
@@ -102,7 +100,6 @@ def _is_incompatible_model_error(error: Exception, horizon: int) -> bool:
     return False
 
 
-
 def _to_1d_float(values: Any) -> np.ndarray:
     array = np.asarray(values, dtype=float)
     if array.ndim > 1:
@@ -112,7 +109,6 @@ def _to_1d_float(values: Any) -> np.ndarray:
     if array.ndim > 1:
         array = array.squeeze()
     return array
-
 
 
 def _align_prediction_length(values: Any, expected: int, context: str) -> np.ndarray:
@@ -129,25 +125,33 @@ def _align_prediction_length(values: Any, expected: int, context: str) -> np.nda
         return np.full(expected, np.nan, dtype=float)
 
     if arr.size > expected:
-        logger.warning(
-            "{ctx}: prediction length {got} > expected {exp}; truncating",
-            ctx=context,
-            got=arr.size,
-            exp=expected,
-        )
+        logger.warning("{ctx}: prediction length {got} > expected {exp}; truncating", ctx=context, got=arr.size, exp=expected)
         return arr[:expected]
 
-    logger.warning(
-        "{ctx}: prediction length {got} < expected {exp}; padding with last value",
-        ctx=context,
-        got=arr.size,
-        exp=expected,
-    )
+    logger.warning("{ctx}: prediction length {got} < expected {exp}; padding with last value", ctx=context, got=arr.size, exp=expected)
     if arr.size == 1:
         return np.repeat(arr[0], expected)
 
     return np.pad(arr, (0, expected - arr.size), mode="edge")
 
+
+def _to_cumulative_log_returns(prices: np.ndarray, base_prices: np.ndarray) -> np.ndarray:
+    """Convert price forecasts to cumulative log-returns with safe guards."""
+    prices_arr = _to_1d_float(prices)
+    base_arr = _to_1d_float(base_prices)
+
+    min_len = min(len(prices_arr), len(base_arr))
+    if min_len == 0:
+        return np.array([], dtype=float)
+
+    prices_arr = prices_arr[-min_len:]
+    base_arr = base_arr[-min_len:]
+
+    invalid_mask = (prices_arr <= 0.0) | (base_arr <= 0.0) | np.isnan(prices_arr) | np.isnan(base_arr)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        converted = np.log(prices_arr / base_arr)
+    converted[invalid_mask] = np.nan
+    return converted
 
 
 def _safe_fit_model(
@@ -161,7 +165,6 @@ def _safe_fit_model(
         model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
     except TypeError:
         model.fit(X_train, y_train)
-
 
 
 def _safe_predict_interval(
@@ -178,7 +181,7 @@ def _safe_predict_interval(
         lower, upper = predict_interval(X_test, alpha=alpha)
     except NotImplementedError:
         return None, None
-    except Exception as exc:  # noqa: BLE001 - optional capability
+    except Exception as exc:  # noqa: BLE001
         logger.warning("Interval prediction failed: {error}", error=str(exc))
         return None, None
 
@@ -187,13 +190,7 @@ def _safe_predict_interval(
     return lower_arr, upper_arr
 
 
-
-def _select_features_granger(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    config: WFVConfig,
-) -> tuple[list[str], dict[str, float]]:
-    """Apply Granger causality filtering."""
+def _select_features_granger(X_train: pd.DataFrame, y_train: pd.Series, config: WFVConfig) -> tuple[list[str], dict[str, float]]:
     selected: list[str] = []
     f_stats: dict[str, float] = {}
 
@@ -204,22 +201,12 @@ def _select_features_granger(
     for feature in X_train.columns:
         combined = pd.concat([y_train, X_train[feature]], axis=1).dropna()
         if combined.shape[0] <= config.max_lag_order + 1:
-            logger.warning("Skipping Granger for {feature}: insufficient samples", feature=feature)
             f_stats[feature] = 0.0
             continue
 
         try:
-            results = grangercausalitytests(
-                combined,
-                maxlag=config.max_lag_order,
-                verbose=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - keep pipeline running
-            logger.warning(
-                "Granger test failed for {feature}: {error}",
-                feature=feature,
-                error=str(exc),
-            )
+            results = grangercausalitytests(combined, maxlag=config.max_lag_order, verbose=False)
+        except Exception:  # noqa: BLE001
             f_stats[feature] = 0.0
             continue
 
@@ -235,18 +222,12 @@ def _select_features_granger(
             selected.append(feature)
 
     if not selected:
-        logger.warning("Granger filter removed all features; keeping original set")
         return list(X_train.columns), f_stats
 
     return selected, f_stats
 
 
-
-def _select_features_vif(
-    X_train: pd.DataFrame,
-    config: WFVConfig,
-) -> list[str]:
-    """Iteratively remove features with high VIF."""
+def _select_features_vif(X_train: pd.DataFrame, config: WFVConfig) -> list[str]:
     features = list(X_train.columns)
     if len(features) <= 1:
         return features
@@ -257,8 +238,7 @@ def _select_features_vif(
         try:
             for idx in range(len(features)):
                 vif_values.append(float(variance_inflation_factor(X_values, idx)))
-        except Exception as exc:  # noqa: BLE001 - keep pipeline running
-            logger.warning("VIF computation failed: {error}", error=str(exc))
+        except Exception:  # noqa: BLE001
             break
 
         max_vif = max(vif_values)
@@ -266,21 +246,14 @@ def _select_features_vif(
             break
 
         max_idx = int(np.argmax(vif_values))
-        removed = features.pop(max_idx)
-        logger.info("Removed {feature} due to high VIF ({vif})", feature=removed, vif=max_vif)
+        features.pop(max_idx)
         if len(features) <= 1:
             break
 
     return features
 
 
-
-def _select_features_correlation(
-    X_train: pd.DataFrame,
-    f_stats: dict[str, float],
-    config: WFVConfig,
-) -> list[str]:
-    """Remove weakly informative features highly correlated with stronger ones."""
+def _select_features_correlation(X_train: pd.DataFrame, f_stats: dict[str, float], config: WFVConfig) -> list[str]:
     features = list(X_train.columns)
     if len(features) <= 1:
         return features
@@ -296,7 +269,6 @@ def _select_features_correlation(
     for feat in ordered:
         if feat in to_remove:
             continue
-
         for other in features:
             if other == feat or other in to_remove:
                 continue
@@ -308,32 +280,14 @@ def _select_features_correlation(
     return [feat for feat in features if feat not in to_remove]
 
 
-
-def _select_features_shap(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    config: WFVConfig,
-) -> list[str]:
-    """Rank features using LightGBM + SHAP."""
+def _select_features_shap(X_train: pd.DataFrame, y_train: pd.Series, config: WFVConfig) -> list[str]:
     try:
-        import lightgbm as lgb  # type: ignore
-    except Exception as exc:  # noqa: BLE001 - optional dependency
-        logger.warning("LightGBM unavailable: {error}", error=str(exc))
+        import lightgbm as lgb
+        import shap
+    except ImportError:
         return list(X_train.columns)
 
-    try:
-        import shap  # type: ignore
-    except Exception as exc:  # noqa: BLE001 - optional dependency
-        logger.warning("SHAP unavailable: {error}", error=str(exc))
-        return list(X_train.columns)
-
-    model = lgb.LGBMRegressor(
-        n_estimators=200,
-        learning_rate=0.05,
-        num_leaves=31,
-        random_state=config.random_state,
-        verbose=-1,
-    )
+    model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=31, random_state=config.random_state, verbose=-1)
 
     try:
         X_values = X_train.to_numpy()
@@ -346,8 +300,7 @@ def _select_features_shap(
             shap_importance = np.abs(shap_array)
         else:
             shap_importance = np.abs(shap_array).mean(axis=0)
-    except Exception as exc:  # noqa: BLE001 - keep pipeline running
-        logger.warning("SHAP ranking failed: {error}", error=str(exc))
+    except Exception:  # noqa: BLE001
         return list(X_train.columns)
 
     importance_series = pd.Series(shap_importance, index=X_train.columns)
@@ -355,56 +308,34 @@ def _select_features_shap(
     return importance_series.sort_values(ascending=False).head(top_k).index.tolist()
 
 
-
-def select_features_in_fold(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    config: WFVConfig,
-) -> list[str]:
-    """Select features within a fold using Granger, VIF, correlation, and SHAP."""
+def select_features_in_fold(X_train: pd.DataFrame, y_train: pd.Series, config: WFVConfig) -> list[str]:
     selected, f_stats = _select_features_granger(X_train, y_train, config)
-
     if not selected:
-        logger.warning("Feature selection stopped after Granger: empty feature set")
         return list(X_train.columns)
 
     vif_features = _select_features_vif(X_train[selected], config)
     if not vif_features:
-        logger.warning("Feature selection stopped after VIF: empty feature set")
         return selected
 
     corr_features = _select_features_correlation(X_train[vif_features], f_stats, config)
     if not corr_features:
-        logger.warning("Feature selection stopped after correlation pruning: empty feature set")
         return vif_features
 
     shap_features = _select_features_shap(X_train[corr_features], y_train, config)
     if not shap_features:
-        logger.warning("Feature selection stopped after SHAP: empty feature set")
         return corr_features
 
     return shap_features
 
 
-
-def _iter_windows(
-    total: int,
-    config: WFVConfig,
-) -> Iterable[tuple[int, int, int, int]]:
-    """Generate rolling/expanding window indices."""
+def _iter_windows(total: int, config: WFVConfig) -> Iterable[tuple[int, int, int, int]]:
     if config.window_type not in {"rolling", "expanding"}:
         raise ValueError("window_type must be 'rolling' or 'expanding'")
 
     fold = 0
     while True:
-        if config.window_type == "rolling":
-            train_start = fold * config.w_step
-        else:
-            train_start = 0
-
-        train_end = train_start + config.w_train + (
-            fold * config.w_step if config.window_type == "expanding" else 0
-        )
+        train_start = fold * config.w_step if config.window_type == "rolling" else 0
+        train_end = train_start + config.w_train + (fold * config.w_step if config.window_type == "expanding" else 0)
         val_end = train_end + config.w_val
         test_end = val_end + config.w_step
 
@@ -415,16 +346,10 @@ def _iter_windows(
         fold += 1
 
 
-
-def _extract_target_series(
-    y_data: pd.Series | pd.DataFrame,
-    horizon: int,
-    mimo_target_col: str | None,
-) -> pd.Series:
+def _extract_target_series(y_data: pd.Series | pd.DataFrame, horizon: int, mimo_target_col: str | None) -> pd.Series:
     if isinstance(y_data, pd.DataFrame) and mimo_target_col and mimo_target_col in y_data.columns:
         return y_data[mimo_target_col]
     return _ensure_series(y_data, horizon)
-
 
 
 def _run_dl_recursive_forecast(
@@ -435,70 +360,48 @@ def _run_dl_recursive_forecast(
     y_test: pd.Series,
     interval_alpha: float,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, float]:
-    """Recursive DL inference (step-by-step with observed test updates)."""
     predictions: list[float] = []
     lower_values: list[float] = []
     upper_values: list[float] = []
     fit_time_total = 0.0
 
     has_interval = callable(getattr(model, "predict_interval", None))
-
     history_X = X_history.copy()
     history_y = y_history.copy()
 
     for step_idx in range(len(X_test)):
         X_step = X_test.iloc[[step_idx]]
-
         start_time = time.perf_counter()
-        _safe_fit_model(model, history_X, history_y, X_val=None, y_val=None)
+        
+        # Avoid extremely slow refitting inside test steps
+        step_pred_raw = model.predict(X_step, history_X=history_X, history_y=history_y)
         fit_time_total += time.perf_counter() - start_time
 
-        step_pred_raw = model.predict(X_step)
-        step_pred = _align_prediction_length(
-            step_pred_raw,
-            expected=1,
-            context=f"dl_recursive_predict_fold_step_{step_idx}",
-        )[0]
+        step_pred = _align_prediction_length(step_pred_raw, 1, f"dl_recursive_step_{step_idx}")[0]
         predictions.append(float(step_pred))
 
         if has_interval:
-            lower_step, upper_step = _safe_predict_interval(
-                model,
-                X_step,
-                expected=1,
-                alpha=interval_alpha,
-            )
+            lower_step, upper_step = _safe_predict_interval(model, X_step, 1, interval_alpha)
             lower_values.append(float(lower_step[0]) if lower_step is not None else np.nan)
             upper_values.append(float(upper_step[0]) if upper_step is not None else np.nan)
 
         actual_value = float(y_test.iloc[step_idx])
         history_X = pd.concat([history_X, X_step], axis=0)
         history_y = pd.concat(
-            [
-                history_y,
-                pd.Series([actual_value], index=X_step.index, name=history_y.name),
-            ],
-            axis=0,
+            [history_y, pd.Series([actual_value], index=X_step.index, name=history_y.name)], axis=0
         )
 
     preds_array = np.asarray(predictions, dtype=float)
-
     if has_interval:
         lower_arr = np.asarray(lower_values, dtype=float)
         upper_arr = np.asarray(upper_values, dtype=float)
-        if np.isnan(lower_arr).all() or np.isnan(upper_arr).all():
-            return preds_array, None, None, fit_time_total
-        return preds_array, lower_arr, upper_arr, fit_time_total
+        if not (np.isnan(lower_arr).all() or np.isnan(upper_arr).all()):
+            return preds_array, lower_arr, upper_arr, fit_time_total
 
     return preds_array, None, None, fit_time_total
 
-def run_wfv(
-    X: pd.DataFrame,
-    y: pd.Series | pd.DataFrame,
-    model: Any,
-    config: WFVConfig,
-) -> tuple[list[WFVIteration], pd.DataFrame]:
-    """Run walk-forward validation loop with feature and target scaling."""
+
+def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WFVConfig) -> tuple[list[WFVIteration], pd.DataFrame]:
     import time
     from sklearn.base import clone
     from sklearn.preprocessing import RobustScaler
@@ -533,12 +436,10 @@ def run_wfv(
     consecutive_failures = 0
 
     windows = list(_iter_windows(len(X), config))
-    progress_bar = tqdm(
-        windows, 
-        desc=f"WFV [{config.model_family.upper()} | h={config.horizon}]", 
-        unit="fold",
-        dynamic_ncols=True
-    )
+    progress_bar = tqdm(windows, desc=f"WFV [{config.model_family.upper()} | h={config.horizon}]", unit="fold", dynamic_ncols=True)
+
+    # Enable target scaling ONLY for continuous ML models
+    scale_target = config.task_type == "regression" and config.model_family == "ml"
 
     for fold_idx, (train_start, train_end, val_end, test_end) in enumerate(progress_bar):
         try:
@@ -550,11 +451,17 @@ def run_wfv(
 
             fold_model = clone(model)
 
-            X_train = X.iloc[train_start:train_end]
+            # Prevent Target Leakage
+            train_end_embargo = train_end - (config.horizon - 1)
+            if train_start >= train_end_embargo:
+                logger.warning("Empty training set after embargo; skipping fold")
+                continue
+
+            X_train = X.iloc[train_start:train_end_embargo]
             X_val = X.iloc[train_end:val_end]
             X_test = X.iloc[test_start_embargo:test_end]
 
-            y_train_raw = y_model.iloc[train_start:train_end]
+            y_train_raw = y_model.iloc[train_start:train_end_embargo]
             y_val_raw = y_model.iloc[train_end:val_end]
             y_test_raw = y_model.iloc[test_start_embargo:test_end]
 
@@ -562,25 +469,18 @@ def run_wfv(
             y_val_target = _extract_target_series(y_val_raw, config.horizon, mimo_target_col)
             y_test_target = _extract_target_series(y_test_raw, config.horizon, mimo_target_col)
 
-            # Target Scaling
-            y_scaler = RobustScaler()
-            y_train_fit = pd.Series(
-                y_scaler.fit_transform(y_train_target.values.reshape(-1, 1)).flatten(),
-                index=y_train_target.index,
-                name=y_train_target.name
-            )
-            y_val_fit = pd.Series(
-                y_scaler.transform(y_val_target.values.reshape(-1, 1)).flatten(),
-                index=y_val_target.index,
-                name=y_val_target.name
-            )
-            y_test_fit = pd.Series(
-                y_scaler.transform(y_test_target.values.reshape(-1, 1)).flatten(),
-                index=y_test_target.index,
-                name=y_test_target.name
-            )
+            # Target Scaling Strategy
+            if scale_target:
+                y_scaler = RobustScaler()
+                y_train_fit = pd.Series(y_scaler.fit_transform(y_train_target.values.reshape(-1, 1)).flatten(), index=y_train_target.index)
+                y_val_fit = pd.Series(y_scaler.transform(y_val_target.values.reshape(-1, 1)).flatten(), index=y_val_target.index)
+                y_test_fit = pd.Series(y_scaler.transform(y_test_target.values.reshape(-1, 1)).flatten(), index=y_test_target.index)
+            else:
+                y_train_fit = y_train_target.copy()
+                y_val_fit = y_val_target.copy()
+                y_test_fit = y_test_target.copy()
 
-            # Feature Scaling
+            # Feature Scaling Strategy
             features_to_scale = [col for col in X_train.columns if col not in forbidden_cols]
             scaler = RobustScaler()
             X_train_scaled, X_val_scaled, X_test_scaled = X_train.copy(), X_val.copy(), X_test.copy()
@@ -622,18 +522,59 @@ def run_wfv(
                 _safe_fit_model(fold_model, X_train_sel, y_train_fit, X_val=X_val_sel, y_val=y_val_fit)
                 fit_time = time.perf_counter() - start_time
 
-                preds_raw = fold_model.predict(X_test_sel)
-                preds_array = _align_prediction_length(preds_raw, len(X_test_sel), f"predict_fold_{fold_idx}")
-                lower_array, upper_array = _safe_predict_interval(fold_model, X_test_sel, len(X_test_sel), config.interval_alpha)
+                has_update = hasattr(fold_model, "update") and callable(getattr(fold_model, "update", None))
+                if has_update:
+                    preds_list = []
+                    lower_list = []
+                    upper_list = []
+                    for i in range(len(X_test_sel)):
+                        X_i = X_test_sel.iloc[[i]]
+                        y_i = y_test_fit.iloc[[i]]
+                        p_i = fold_model.predict(X_i)
+                        l_i, u_i = _safe_predict_interval(fold_model, X_i, 1, config.interval_alpha)
+                        
+                        preds_list.append(p_i[0] if p_i.size > 0 else 0.0)
+                        if l_i is not None and u_i is not None:
+                            lower_list.append(l_i[0] if l_i.size > 0 else np.nan)
+                            upper_list.append(u_i[0] if u_i.size > 0 else np.nan)
+                            
+                        try:
+                            fold_model.update(y_true=y_i.values, y_pred=p_i)
+                        except Exception:
+                            pass
+                    
+                    preds_array = np.array(preds_list)
+                    lower_array = np.array(lower_list) if lower_list else None
+                    upper_array = np.array(upper_list) if upper_list else None
+                else:
+                    preds_raw = fold_model.predict(X_test_sel)
+                    preds_array = _align_prediction_length(preds_raw, len(X_test_sel), f"predict_fold_{fold_idx}")
+                    lower_array, upper_array = _safe_predict_interval(fold_model, X_test_sel, len(X_test_sel), config.interval_alpha)
 
             # Inverse Target Scaling
-            preds_array = y_scaler.inverse_transform(preds_array.reshape(-1, 1)).flatten()
-            if lower_array is not None:
-                lower_array = y_scaler.inverse_transform(lower_array.reshape(-1, 1)).flatten()
-            if upper_array is not None:
-                upper_array = y_scaler.inverse_transform(upper_array.reshape(-1, 1)).flatten()
+            if scale_target:
+                preds_array = y_scaler.inverse_transform(preds_array.reshape(-1, 1)).flatten()
+                if lower_array is not None:
+                    lower_array = y_scaler.inverse_transform(lower_array.reshape(-1, 1)).flatten()
+                if upper_array is not None:
+                    upper_array = y_scaler.inverse_transform(upper_array.reshape(-1, 1)).flatten()
 
             actuals_array = _to_1d_float(y_test_target)
+
+            # DL price-space predictions to cumulative log-return space
+            if config.model_family == "dl" and config.task_type == "regression":
+                base_prices = _to_1d_float(y_model.loc[X_test_sel.index])
+                # DL targets must represent the price at T+h to yield meaningful log returns
+                shifted_y_model = y_model.shift(-config.horizon)
+                actuals_array = _to_1d_float(shifted_y_model.loc[X_test_sel.index])
+
+                preds_array = _to_cumulative_log_returns(preds_array, base_prices)
+                actuals_array = _to_cumulative_log_returns(actuals_array, base_prices)
+                if lower_array is not None:
+                    lower_array = _to_cumulative_log_returns(lower_array, base_prices)
+                if upper_array is not None:
+                    upper_array = _to_cumulative_log_returns(upper_array, base_prices)
+
             fold_predictions = pd.DataFrame({pred_col_name: preds_array}, index=X_test_sel.index)
             if lower_array is not None and upper_array is not None:
                 fold_predictions["lower"], fold_predictions["upper"] = lower_array, upper_array
@@ -675,12 +616,8 @@ def run_wfv(
     predictions_df.attrs["horizon"] = config.horizon
     return iterations, predictions_df
 
-def load_cached_results(
-    model_name: str,
-    horizon: int,
-    output_dir: str | Path,
-) -> tuple[list[WFVIteration], pd.DataFrame] | None:
-    """Load cached predictions/audit if present."""
+
+def load_cached_results(model_name: str, horizon: int, output_dir: str | Path) -> tuple[list[WFVIteration], pd.DataFrame] | None:
     output_path = Path(output_dir)
     predictions_path = output_path / f"predictions_{model_name}_{horizon}.parquet"
     audit_path = output_path / f"audit_{model_name}_{horizon}.json"
@@ -690,21 +627,10 @@ def load_cached_results(
 
     try:
         predictions_df = pd.read_parquet(predictions_path)
-    except Exception as exc:  # noqa: BLE001 - fallback to recompute
-        logger.warning(
-            "Failed to load cached predictions for {model} horizon {h}: {error}",
-            model=model_name,
-            h=horizon,
-            error=str(exc),
-        )
+    except Exception:  # noqa: BLE001
         return None
 
     if predictions_df.empty:
-        logger.warning(
-            "Cached predictions empty for {model} horizon {h}; rerunning WFV",
-            model=model_name,
-            h=horizon,
-        )
         return None
 
     if not isinstance(predictions_df.index, pd.DatetimeIndex):
@@ -713,23 +639,10 @@ def load_cached_results(
 
     predictions_df = predictions_df.sort_index()
     predictions_df.attrs["horizon"] = horizon
-
-    logger.info(
-        "Using cached WFV results for {model} horizon {h}; skipping training",
-        model=model_name,
-        h=horizon,
-    )
     return [], predictions_df
 
 
-
-def save_wfv_results(
-    iterations: list[WFVIteration],
-    predictions: pd.Series | pd.DataFrame,
-    model_name: str,
-    output_dir: str | Path,
-) -> None:
-    """Save predictions and audit logs."""
+def save_wfv_results(iterations: list[WFVIteration], predictions: pd.Series | pd.DataFrame, model_name: str, output_dir: str | Path) -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -781,18 +694,6 @@ def save_wfv_results(
     with audit_path.open("w", encoding="utf-8") as handle:
         json.dump(audit_payload, handle, indent=2)
 
-    avg_features = float(np.mean([it.n_features_selected for it in iterations])) if iterations else 0.0
-    total_time = float(np.sum([it.fit_time_seconds for it in iterations])) if iterations else 0.0
-
-    logger.info("Saved predictions to {path}", path=predictions_path)
-    logger.info("Saved audit log to {path}", path=audit_path)
-    logger.info(
-        "WFV summary: folds={folds}, avg_features={avg}, total_fit_time={time}",
-        folds=len(iterations),
-        avg=avg_features,
-        time=total_time,
-    )
-
 
 if __name__ == "__main__":
     from sklearn.ensemble import RandomForestRegressor
@@ -811,6 +712,7 @@ if __name__ == "__main__":
 
     config = WFVConfig(
         model_family="ml",
+        task_type="regression",
         max_lag_order=int(config_data.get("max_lag_order", 10)),
     )
 
