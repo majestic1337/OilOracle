@@ -223,3 +223,39 @@ def load_dl_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Series]
     X_dl.insert(1, "ds", pd.DatetimeIndex(X_dl.index))
 
     return X_dl, y_aligned
+
+
+def load_dl_unshifted_data(
+    data_dir: Path,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Load DL data with **unshifted** target for MIMO architectures.
+
+    NeuralForecast MIMO models (TFT, N-BEATS, PatchTST) project the horizon
+    internally via the ``h`` parameter. They must be trained on the raw,
+    unshifted ``brent_return`` series — NOT on ``target_h{horizon}`` which is
+    pre-shifted by ``h`` steps via the Direct strategy.
+
+    Returns:
+        (X, y_raw) where ``y_raw`` is the raw ``brent_return`` column from
+        the ML feature matrix, aligned to the same index as X.
+    """
+    feature_path = data_dir / "feature_matrix_ml.parquet"
+    if not feature_path.exists():
+        raise FileNotFoundError(f"ML feature matrix not found for DL training: {feature_path}")
+
+    X_ml = pd.read_parquet(feature_path)
+
+    if "brent_return" not in X_ml.columns:
+        raise ValueError(
+            "feature_matrix_ml.parquet must contain 'brent_return' column "
+            "for unshifted DL target"
+        )
+
+    y_raw = X_ml["brent_return"].copy().astype(float).rename("y")
+
+    # Drop rows where brent_return is NaN (start-of-series)
+    valid_mask = y_raw.notna()
+    X_aligned = X_ml.loc[valid_mask].sort_index()
+    y_aligned = y_raw.loc[valid_mask].sort_index()
+
+    return X_aligned, y_aligned

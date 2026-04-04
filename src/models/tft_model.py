@@ -8,7 +8,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from loguru import logger
-from neuralforecast.losses.pytorch import MQLoss
+try:
+    from neuralforecast.losses.pytorch import MQLoss
+except Exception:  # noqa: BLE001 - optional dependency
+    MQLoss = None  # type: ignore[assignment]
 
 from src.models.dl_wrapper import DeepLearningForecasterWrapper
 
@@ -22,52 +25,79 @@ class TFTForecaster(DeepLearningForecasterWrapper):
     that ingests all four series (brent, wti, dxy, gold) as exogenous features.
     """
 
-    def __init__(self, horizon: int, input_size: int | None = None) -> None:
-        if input_size is None:
-            input_size = 4 * horizon
+    def __init__(
+        self,
+        horizon: int,
+        input_size: int = 30,
+        max_steps: int = 50,
+        learning_rate: float = 1e-3,
+        scaler_type: str = "standard",
+        local_scaler_type: str | None = None,
+    ) -> None:
+        self.max_steps = int(max_steps)
+        self.learning_rate = float(learning_rate)
+        self.scaler_type = scaler_type
+        self.local_scaler_type = local_scaler_type
+        self.horizon = horizon
+        self.input_size = int(input_size)
 
         try:
             from neuralforecast.models import TFT
         except Exception as exc:  # noqa: BLE001 - optional dependency
             raise ImportError("neuralforecast is required for TFTForecaster") from exc
 
-        loss = None
-        try:
-            from neuralforecast.losses.pytorch import QuantileLoss
-
-            loss = MQLoss(level=[80, 90])
-        except Exception as exc:  # noqa: BLE001 - optional dependency
-            logger.warning(
-                "QuantileLoss unavailable; TFT will output point forecasts: {error}",
-                error=str(exc),
+        if MQLoss is None:
+            raise ImportError(
+                "TFTForecaster requires quantile-capable loss (MQLoss) "
+                "to produce prediction intervals."
             )
+        self.loss = MQLoss(level=[80])
 
         logger.info("Initializing TFT forecaster with horizon {h}", h=horizon)
 
         model_kwargs: dict[str, Any] = {
-            "hidden_size": 64,
+            "hidden_size": 8,
             "n_head": 4,
-            "dropout": 0.1,
-            "attn_dropout": 0.1,
-            "max_steps": 300,
-            "learning_rate": 1e-3,
-            "val_check_steps": 50,
-            "early_stop_patience_steps": 10,
+            "max_steps": self.max_steps,
+            "learning_rate": self.learning_rate,
+            "scaler_type": self.scaler_type,
+            "val_check_steps": 100,
+            "early_stop_patience_steps": -1,
             "random_seed": 42,
+            "loss": self.loss,
             "accelerator": "cpu",
         }
         signature = inspect.signature(TFT)
         if "num_encoder_layers" in signature.parameters:
             model_kwargs["num_encoder_layers"] = 2
-        if loss is not None:
-            model_kwargs["loss"] = loss
 
         super().__init__(
             model_class=TFT,
             horizon=horizon,
-            input_size=input_size,
+            input_size=self.input_size,
+            local_scaler_type=self.local_scaler_type,
             **model_kwargs,
         )
+
+    def get_params(self, deep: bool = True) -> dict[str, Any]:
+        return {
+            "horizon": self.horizon,
+            "input_size": self.input_size,
+            "max_steps": self.max_steps,
+            "learning_rate": self.learning_rate,
+            "scaler_type": self.scaler_type,
+            "local_scaler_type": self.local_scaler_type,
+        }
+
+    def set_params(self, **params: Any) -> "TFTForecaster":
+        for key, value in params.items():
+            setattr(self, key, value)
+
+        if hasattr(self, "model_kwargs"):
+            self.model_kwargs["max_steps"] = int(self.max_steps)
+            self.model_kwargs["learning_rate"] = float(self.learning_rate)
+            self.model_kwargs["scaler_type"] = self.scaler_type
+        return self
 
     @staticmethod
     def _find_quantile_column(columns: list[str], quantile: float) -> str | None:
@@ -86,9 +116,14 @@ class TFTForecaster(DeepLearningForecasterWrapper):
                 return col
         return None
 
-    def predict(self, X: Any) -> np.ndarray:
+    def predict(
+        self,
+        X: Any,
+        history_X: Any | None = None,
+        history_y: Any | None = None,
+    ) -> np.ndarray:
         """Return the median (q50) forecast from the TFT quantile outputs."""
-        forecast_df = self._predict_df(X)
+        forecast_df = self._predict_df(X, history_X=history_X, history_y=history_y)
         pred_columns = [col for col in forecast_df.columns if col not in {"unique_id", "ds"}]
         if not pred_columns:
             raise ValueError("No prediction columns returned by NeuralForecast")
@@ -112,22 +147,42 @@ class TFTForecaster(DeepLearningForecasterWrapper):
 
         return preds
 
-    def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
+    def predict_interval(
+        self,
+        X: Any,
+        alpha: float = 0.1,
+        history_X: Any | None = None,
+        history_y: Any | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return native quantile intervals (q10, q90) from the TFT output."""
         if alpha != 0.1:
             logger.warning("TFT uses fixed quantiles; ignoring alpha override")
 
-        forecast_df = self._predict_df(X)
+        forecast_df = self._predict_df(X, history_X=history_X, history_y=history_y)
 
         exclude = {"unique_id", "ds"}
         model_cols = [col for col in forecast_df.columns if col not in exclude]
         if not model_cols:
             raise ValueError("No forecast columns in neuralforecast output")
 
-        q10_col = next((col for col in model_cols if "10" in col), None)
-        q90_col = next((col for col in model_cols if "90" in col), None)
+        q10_col = next(
+            (
+                col
+                for col in model_cols
+                if "lo-80" in col.lower() or "q.1" in col.lower() or "q10" in col.lower()
+            ),
+            None,
+        )
+        q90_col = next(
+            (
+                col
+                for col in model_cols
+                if "hi-80" in col.lower() or "q.9" in col.lower() or "q90" in col.lower()
+            ),
+            None,
+        )
         if q10_col is None or q90_col is None:
-            raise ValueError("Quantile outputs not found for TFT; ensure QuantileLoss is enabled")
+            raise ValueError("Quantile outputs not found for TFT; ensure MQLoss quantiles are enabled")
 
         lower = forecast_df[q10_col].values[: len(X)]
         upper = forecast_df[q90_col].values[: len(X)]

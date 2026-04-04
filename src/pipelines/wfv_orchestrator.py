@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import time
 from dataclasses import dataclass
@@ -366,7 +367,20 @@ def _run_dl_recursive_forecast(
     X_test: pd.DataFrame,
     y_test: pd.Series,
     interval_alpha: float,
+    y_raw: pd.Series | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, float]:
+    """Run step-by-step recursive DL forecast.
+
+    Parameters
+    ----------
+    y_test : pd.Series
+        Shifted target (target_h{horizon}) — used ONLY for final metric calculation
+        by the caller, NOT for updating autoregressive history.
+    y_raw : pd.Series | None
+        Unshifted raw target (brent_return at time t) — used to update
+        ``history_y`` at each step so the model sees actual observed values
+        without future leakage.
+    """
     predictions: list[float] = []
     lower_values: list[float] = []
     upper_values: list[float] = []
@@ -375,6 +389,9 @@ def _run_dl_recursive_forecast(
     has_interval = callable(getattr(model, "predict_interval", None))
     history_X = X_history.copy()
     history_y = y_history.copy()
+
+    # Use y_raw for history updates; fall back to y_test if not provided
+    y_for_history = y_raw if y_raw is not None else y_test
 
     for step_idx in range(len(X_test)):
         X_step = X_test.iloc[[step_idx]]
@@ -392,10 +409,11 @@ def _run_dl_recursive_forecast(
             lower_values.append(float(lower_step[0]) if lower_step is not None else np.nan)
             upper_values.append(float(upper_step[0]) if upper_step is not None else np.nan)
 
-        actual_value = float(y_test.iloc[step_idx])
+        # Update history with UNSHIFTED raw observation (not shifted target)
+        raw_value = float(y_for_history.iloc[step_idx])
         history_X = pd.concat([history_X, X_step], axis=0)
         history_y = pd.concat(
-            [history_y, pd.Series([actual_value], index=X_step.index, name=history_y.name)], axis=0
+            [history_y, pd.Series([raw_value], index=X_step.index, name=history_y.name)], axis=0
         )
 
     preds_array = np.asarray(predictions, dtype=float)
@@ -408,7 +426,30 @@ def _run_dl_recursive_forecast(
     return preds_array, None, None, fit_time_total
 
 
-def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WFVConfig) -> tuple[list[WFVIteration], pd.DataFrame]:
+def run_wfv(
+    X: pd.DataFrame, 
+    y: pd.Series | pd.DataFrame, 
+    model: Any, 
+    config: WFVConfig,
+    model_name: str | None = None,
+    output_dir: str | Path | None = None,
+    y_eval: pd.Series | None = None,
+) -> tuple[list[WFVIteration], pd.DataFrame]:
+    """Walk-Forward Validation loop.
+
+    Parameters
+    ----------
+    y : pd.Series | pd.DataFrame
+        Target used for model **training**. For ML models this is the
+        pre-shifted ``target_h{horizon}``. For DL MIMO models this is the
+        raw, unshifted ``brent_return`` series.
+    y_eval : pd.Series | None
+        Optional shifted target used **only** for evaluation / actuals
+        comparison. When provided (typically for DL MIMO models), the
+        ``actuals_array`` recorded in each fold comes from ``y_eval``
+        rather than ``y``. This prevents conflating the training target
+        with the evaluation target. When ``None``, ``y`` is used for both.
+    """
     import time
     from sklearn.base import clone
     from sklearn.preprocessing import RobustScaler
@@ -429,12 +470,27 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
         y_model = _ensure_series(y, config.horizon)
 
     common_index = X.index.intersection(y_model.index)
+    if y_eval is not None:
+        common_index = common_index.intersection(y_eval.index)
     X = X.loc[common_index].sort_index()
     y_model = y_model.loc[common_index].sort_index()
+    if y_eval is not None:
+        y_eval = y_eval.loc[common_index].sort_index()
 
     iterations: list[WFVIteration] = []
     predictions_list: list[pd.DataFrame] = []
     pred_col_name = f"pred_h{config.horizon}"
+    
+    last_completed_fold = -1
+    if model_name is not None and output_dir is not None:
+        cached = load_cached_results(model_name, config.horizon, output_dir)
+        if cached is not None:
+            cached_iters, cached_preds = cached
+            if cached_iters:
+                last_completed_fold = max(it.fold_idx for it in cached_iters)
+                iterations = cached_iters
+                predictions_list = [cached_preds]
+                logger.info("Resuming WFV from fold {f}", f=last_completed_fold + 1)
     
     forbidden_cols = {"unique_id", "ds", "y"}
     static_features = [col for col in X.columns if col not in forbidden_cols]
@@ -449,6 +505,9 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
     scale_target = config.task_type == "regression" and config.model_family == "ml"
 
     for fold_idx, (train_start, train_end, val_end, test_end) in enumerate(progress_bar):
+        if fold_idx <= last_completed_fold:
+            continue
+            
         try:
             embargo_steps = config.horizon - 1
             test_start_embargo = val_end + embargo_steps
@@ -471,6 +530,12 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
             y_train_raw = y_model.iloc[train_start:train_end_embargo]
             y_val_raw = y_model.iloc[train_end:val_end]
             y_test_raw = y_model.iloc[test_start_embargo:test_end]
+
+            # For DL MIMO: y_eval provides the shifted target for metric evaluation
+            if y_eval is not None:
+                y_eval_test = y_eval.iloc[test_start_embargo:test_end]
+            else:
+                y_eval_test = None
 
             y_train_target = _extract_target_series(y_train_raw, config.horizon, mimo_target_col)
             y_val_target = _extract_target_series(y_val_raw, config.horizon, mimo_target_col)
@@ -510,25 +575,35 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
             X_val_sel = X_val_scaled[selected_features]
             X_test_sel = X_test_scaled[selected_features]
 
-            fit_time = 0.0
             lower_array, upper_array = None, None
 
+            # 1. ГАРАНТОВАНЕ ТРЕНУВАННЯ ДЛЯ ВСІХ МОДЕЛЕЙ
+            start_time = time.perf_counter()
+            _safe_fit_model(fold_model, X_train_sel, y_train_fit, X_val=X_val_sel, y_val=y_val_fit)
+            fit_time = time.perf_counter() - start_time
+
+            # 2. ГЕНЕРАЦІЯ ПРОГНОЗІВ
             if config.model_family == "dl" and config.dl_recursive:
                 X_history = pd.concat([X_train_sel, X_val_sel], axis=0).sort_index()
                 y_history = pd.concat([y_train_fit, y_val_fit], axis=0).sort_index()
-                preds_array, lower_array, upper_array, fit_time = _run_dl_recursive_forecast(
+                # Extract raw brent_return from X for history updates (no leakage)
+                y_raw_test = None
+                if "brent_return" in X_test.columns:
+                    y_raw_test = X_test["brent_return"].iloc[
+                        :len(X_test_sel)
+                    ].copy()
+                    y_raw_test.index = X_test_sel.index
+                preds_array, lower_array, upper_array, add_fit_time = _run_dl_recursive_forecast(
                     model=fold_model,
                     X_history=X_history,
                     y_history=y_history,
                     X_test=X_test_sel,
                     y_test=y_test_fit,
                     interval_alpha=config.interval_alpha,
+                    y_raw=y_raw_test,
                 )
+                fit_time += add_fit_time
             else:
-                start_time = time.perf_counter()
-                _safe_fit_model(fold_model, X_train_sel, y_train_fit, X_val=X_val_sel, y_val=y_val_fit)
-                fit_time = time.perf_counter() - start_time
-
                 has_update = hasattr(fold_model, "update") and callable(getattr(fold_model, "update", None))
                 if has_update:
                     preds_list = []
@@ -566,7 +641,11 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
                 if upper_array is not None:
                     upper_array = y_scaler.inverse_transform(upper_array.reshape(-1, 1)).flatten()
 
-            actuals_array = _to_1d_float(y_test_target)
+            # Actuals: use y_eval (shifted target) for DL MIMO, else use y_test_target
+            if y_eval_test is not None:
+                actuals_array = _to_1d_float(y_eval_test)
+            else:
+                actuals_array = _to_1d_float(y_test_target)
 
             fold_predictions = pd.DataFrame({pred_col_name: preds_array}, index=X_test_sel.index)
             if lower_array is not None and upper_array is not None:
@@ -595,8 +674,32 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
                 )
             )
 
+            if model_name is not None and output_dir is not None:
+                current_preds = pd.concat(predictions_list, axis=0)
+                current_preds = current_preds[~current_preds.index.duplicated(keep='last')].sort_index()
+                current_preds.attrs["horizon"] = config.horizon
+                save_wfv_results(iterations, current_preds, model_name, output_dir)
+
+            # Memory cleanup for DL models (PyTorch/Lightning graph accumulation)
+            if config.model_family == "dl":
+                del fold_model
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+
         except Exception as exc:
             consecutive_failures += 1
+            logger.warning(
+                "WFV fold {fold} failed for model_family={family}, h={h}: {error}",
+                fold=fold_idx,
+                family=config.model_family,
+                h=config.horizon,
+                error=str(exc),
+            )
             if _is_incompatible_model_error(exc, config.horizon) or consecutive_failures >= config.max_consecutive_failures:
                 skip_model = True
                 break
@@ -605,7 +708,11 @@ def run_wfv(X: pd.DataFrame, y: pd.Series | pd.DataFrame, model: Any, config: WF
     if skip_model:
         return [], pd.DataFrame(columns=[pred_col_name])
 
-    predictions_df = pd.concat(predictions_list, axis=0).sort_index() if predictions_list else pd.DataFrame(columns=[pred_col_name])
+    if predictions_list:
+        predictions_df = pd.concat(predictions_list, axis=0)
+        predictions_df = predictions_df[~predictions_df.index.duplicated(keep='last')].sort_index()
+    else:
+        predictions_df = pd.DataFrame(columns=[pred_col_name])
     predictions_df.attrs["horizon"] = config.horizon
     return iterations, predictions_df
 
@@ -632,7 +739,36 @@ def load_cached_results(model_name: str, horizon: int, output_dir: str | Path) -
 
     predictions_df = predictions_df.sort_index()
     predictions_df.attrs["horizon"] = horizon
-    return [], predictions_df
+
+    try:
+        with audit_path.open("r", encoding="utf-8") as handle:
+            audit_data = json.load(handle)
+        
+        iterations = []
+        for row in audit_data:
+            iterations.append(
+                WFVIteration(
+                    fold_idx=row["fold_idx"],
+                    train_start=pd.Timestamp(row["train_start"]),
+                    train_end=pd.Timestamp(row["train_end"]),
+                    test_start=pd.Timestamp(row["test_start"]),
+                    test_end=pd.Timestamp(row["test_end"]),
+                    selected_features=row["selected_features"],
+                    n_features_input=row["n_features_input"],
+                    n_features_selected=row["n_features_selected"],
+                    scaler_center=np.array(row["scaler_center"]),
+                    scaler_scale=np.array(row["scaler_scale"]),
+                    predictions=np.array(row["predictions"]),
+                    lower_bounds=np.array(row["lower_bounds"]),
+                    upper_bounds=np.array(row["upper_bounds"]),
+                    actuals=np.array(row["actuals"]),
+                    fit_time_seconds=row["fit_time_seconds"],
+                )
+            )
+    except Exception:  # noqa: BLE001
+        iterations = []
+
+    return iterations, predictions_df
 
 
 def save_wfv_results(iterations: list[WFVIteration], predictions: pd.Series | pd.DataFrame, model_name: str, output_dir: str | Path) -> None:

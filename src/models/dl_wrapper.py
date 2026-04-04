@@ -43,11 +43,13 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         model_class: type[Any],
         horizon: int,
         input_size: int,
+        local_scaler_type: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.model_class = model_class
         self.horizon = horizon
         self.input_size = input_size
+        self.local_scaler_type = local_scaler_type
         self.model_kwargs = kwargs
         self._logger = logger.bind(model=self.__class__.__name__)
         self._accelerator = "cpu"
@@ -61,22 +63,47 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self._logger.info("Using CPU for DL training (GPU disabled)")
 
     def get_params(self, deep: bool = True) -> dict[str, Any]:
-        """Override get_params to correctly clone **kwargs for NeuralForecast."""
-        params: dict[str, Any] = {
-            "model_class": self.model_class,
-            "horizon": self.horizon,
-            "input_size": self.input_size,
-        }
-        params.update(self.model_kwargs)
+        """Return clone-safe params.
+
+        For the base wrapper class, preserve dynamic `**kwargs` so direct usage
+        of `DeepLearningForecasterWrapper` remains clone-compatible.
+        For subclasses (e.g., TFT/NBEATS wrappers), return only constructor
+        parameters accepted by the subclass `__init__`.
+        """
+        if self.__class__ is DeepLearningForecasterWrapper:
+            params: dict[str, Any] = {
+                "model_class": self.model_class,
+                "horizon": self.horizon,
+                "input_size": self.input_size,
+                "local_scaler_type": self.local_scaler_type,
+            }
+            params.update(self.model_kwargs)
+            return params
+
+        params: dict[str, Any] = {}
+        signature = inspect.signature(self.__class__.__init__)
+        for name, parameter in signature.parameters.items():
+            if name == "self":
+                continue
+            if parameter.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+            if hasattr(self, name):
+                params[name] = getattr(self, name)
         return params
 
     def set_params(self, **params: Any) -> "DeepLearningForecasterWrapper":
-        """Override set_params to restore **kwargs."""
+        """Set clone/grid-search params, including dynamic model kwargs."""
+        core_keys = {"model_class", "horizon", "input_size", "local_scaler_type"}
         for key, value in params.items():
-            if key in {"model_class", "horizon", "input_size"}:
+            if key in core_keys:
                 setattr(self, key, value)
             else:
                 self.model_kwargs[key] = value
+                if self.__class__ is not DeepLearningForecasterWrapper:
+                    setattr(self, key, value)
         return self
 
     def _prepare_df(self, X: pd.DataFrame, y: pd.Series = None) -> pd.DataFrame:
@@ -157,7 +184,7 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self._nf = NeuralForecast(
             models=[self.model_instance],
             freq="B",
-            local_scaler_type=None,
+            local_scaler_type=self.local_scaler_type,
         )
         self.nf = self._nf
 
@@ -177,47 +204,103 @@ class DeepLearningForecasterWrapper(BaseForecaster):
 
         return self
 
+    def _has_futr_exog(self) -> bool:
+        """Check if the underlying NeuralForecast model uses future exogenous features."""
+        if self._model is None:
+            return False
+        futr_list = getattr(self._model, "futr_exog_list", None)
+        return bool(futr_list)
+
     def _predict_df(self, X_test: pd.DataFrame, history_X: pd.DataFrame | None = None, history_y: pd.Series | None = None) -> pd.DataFrame:
         if self._nf is None:
             raise ValueError("Model must be fitted before prediction")
 
-        futr_df = self._build_future_df(X_test)
-        
+        futr_df = self._build_future_df(X_test, history_X)
+
         hist_df = None
         if history_X is not None and history_y is not None:
-             hist_df = self._prepare_df(history_X, history_y)
+            hist_df = self._prepare_df(history_X, history_y)
 
         forecast_df = self._predict_with_futr_df(futr_df, hist_df)
         forecast_df = self._normalize_forecast_df(forecast_df, futr_df)
 
-        if len(forecast_df) != len(futr_df):
-            self._logger.warning(
-                "Forecast length {pred_len} does not match future length {future_len}; aligning only",
-                pred_len=len(forecast_df),
-                future_len=len(futr_df),
+        # MIMO h-th step extraction for step-by-step WFV:
+        # NeuralForecast returns h rows [t+1, ..., t+h]. When futr_df has
+        # only 1 row (step-by-step recursive), we must extract the h-th
+        # element BEFORE _align_forecast_to_future truncates the vector.
+        # We then overwrite its date with futr_df's date so alignment works.
+        if len(futr_df) == 1 and len(forecast_df) >= self.horizon:
+            forecast_df = forecast_df.iloc[[self.horizon - 1]].copy()
+            forecast_df["ds"] = futr_df["ds"].values[0]
+            self._logger.debug(
+                "Step-by-step: extracted h={h} element from forecast",
+                h=self.horizon,
             )
 
-        forecast_df = self._align_forecast_to_future(forecast_df, futr_df)
+        n_expected = min(self.horizon, len(futr_df))
+        if len(forecast_df) != len(futr_df) and len(futr_df) > 1:
+            self._logger.info(
+                "Forecast length {pred_len} vs future length {future_len}; "
+                "trimming futr_df to model horizon h={h}",
+                pred_len=len(forecast_df),
+                future_len=len(futr_df),
+                h=self.horizon,
+            )
+
+        forecast_df = self._align_forecast_to_future(forecast_df, futr_df, n_expected)
 
         logger.info(
             "DL Predict Diagnostics - shape: {shape}, cols: {cols}",
             shape=forecast_df.shape,
             cols=list(forecast_df.columns),
         )
-        if "ds" in forecast_df.columns:
-            logger.info("DL Predict Diagnostics - unique ds count: {count}", count=forecast_df["ds"].nunique())
-        elif forecast_df.index.name == "ds":
-            logger.info("DL Predict Diagnostics - unique ds count (index): {count}", count=forecast_df.index.nunique())
 
         return forecast_df
 
-    def _build_future_df(self, X_test: pd.DataFrame) -> pd.DataFrame:
+    def _build_future_df(
+        self,
+        X_test: pd.DataFrame,
+        history_X: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Build a future DataFrame for NeuralForecast.predict().
+
+        Generates business-day dates strictly continuous from the last known
+        historical observation. During WFV, ``history_X`` (train+val window)
+        is used as the authoritative source for both the last date and exog
+        fallback values, overriding ``_last_train_df`` which may lag behind
+        the current fold's window.
+        """
         if X_test.empty:
             raise ValueError("X_test is empty")
 
-        last_date = self._last_train_df["ds"].max() if self._last_train_df is not None else pd.Timestamp.now()
-        expected_dates = pd.date_range(start=last_date, periods=len(X_test) + 1, freq="B")[1:].normalize()
+        # --- Resolve last date: prefer history_X index over _last_train_df ---
+        if history_X is not None and not history_X.empty:
+            try:
+                last_date = pd.DatetimeIndex(history_X.index).max()
+                if last_date.tz is not None:
+                    last_date = last_date.tz_convert(None)
+                last_date = last_date.normalize()
+            except Exception:  # noqa: BLE001
+                last_date = (
+                    self._last_train_df["ds"].max()
+                    if self._last_train_df is not None
+                    else pd.Timestamp.now()
+                )
+        else:
+            last_date = (
+                self._last_train_df["ds"].max()
+                if self._last_train_df is not None
+                else pd.Timestamp.now()
+            )
 
+        # --- Generate continuous business-day dates from training end ---
+        n_periods = len(X_test)
+        expected_dates = pd.bdate_range(
+            start=last_date + pd.tseries.offsets.BDay(1),
+            periods=n_periods,
+        ).normalize()
+
+        # --- Try to use X_test's own index if it matches exactly ---
         use_x_index = False
         ds_index: pd.DatetimeIndex | None = None
         try:
@@ -231,57 +314,71 @@ class DeepLearningForecasterWrapper(BaseForecaster):
                 use_x_index = True
             else:
                 self._logger.warning(
-                    "X_test index not continuous/expected; using business-day future dates from {start}",
-                    start=last_date,
+                    "X_test index ({x_len} rows) not continuous from last known "
+                    "date {last_date}; using generated business-day dates",
+                    x_len=len(ds_index),
+                    last_date=last_date.date(),
                 )
         except Exception as exc:  # noqa: BLE001 - defensive fallback
             self._logger.warning(
-                "Failed to use X_test index for future df; falling back to continuous dates: {error}",
+                "Failed to parse X_test index as DatetimeIndex: {error}",
                 error=str(exc),
             )
 
-        if use_x_index and ds_index is not None:
-            futr_df = pd.DataFrame({"unique_id": "brent", "ds": ds_index})
-        else:
-            futr_df = pd.DataFrame({"unique_id": "brent", "ds": expected_dates})
+        dates = ds_index if (use_x_index and ds_index is not None) else expected_dates
+        futr_df = pd.DataFrame({"unique_id": "brent", "ds": dates})
 
-        if self._supports_exogenous():
-            if use_x_index:
+        # --- Attach exogenous columns (only for models that support them) ---
+        if self._supports_exogenous() and self._exog_columns:
+            # Retrieve last known historical values: prefer history_X, fall back to _last_train_df
+            hist_last_values: dict[str, float] = {}
+            hist_source = history_X if (history_X is not None and not history_X.empty) else None
+            if hist_source is not None:
                 for col in self._exog_columns:
-                    if col in X_test.columns:
-                        vals = X_test[col].values
-                        if len(vals) < len(futr_df):
-                            vals = np.pad(vals, (0, len(futr_df) - len(vals)), mode="edge")
-                        elif len(vals) > len(futr_df):
-                            vals = vals[: len(futr_df)]
-                        futr_df[col] = vals
-            else:
-                exog_df = X_test.copy()
-                exog_df = exog_df.reset_index().rename(columns={exog_df.index.name or "index": "ds"})
-                exog_df["ds"] = pd.to_datetime(exog_df["ds"])
-                if exog_df["ds"].dt.tz is not None:
-                    exog_df["ds"] = exog_df["ds"].dt.tz_convert(None)
-                exog_df["ds"] = exog_df["ds"].dt.normalize()
-                futr_df["ds"] = pd.to_datetime(futr_df["ds"]).dt.normalize()
-                merged = futr_df[["ds"]].merge(exog_df, on="ds", how="left")
+                    if col in hist_source.columns:
+                        last_val = hist_source[col].dropna()
+                        hist_last_values[col] = float(last_val.iloc[-1]) if len(last_val) > 0 else 0.0
+            elif self._last_train_df is not None:
                 for col in self._exog_columns:
-                    if col in merged.columns:
-                        series = merged[col]
-                        if series.isna().any():
-                            series = series.ffill().bfill()
-                            if series.isna().any():
-                                series = series.fillna(0.0)
-                                self._logger.warning(
-                                    "Filled remaining NaNs for exogenous feature {col} with 0.0",
-                                    col=col,
-                                )
-                        futr_df[col] = series.values
+                    if col in self._last_train_df.columns:
+                        last_val = self._last_train_df[col].dropna()
+                        hist_last_values[col] = float(last_val.iloc[-1]) if len(last_val) > 0 else 0.0
+
+            for col in self._exog_columns:
+                if col in X_test.columns:
+                    vals = X_test[col].values.copy().astype(float)
+                    # Fill NaN from last known historical value
+                    nan_mask = np.isnan(vals)
+                    if nan_mask.any():
+                        fill_val = hist_last_values.get(col, 0.0)
+                        vals[nan_mask] = fill_val
+                        self._logger.info(
+                            "Filled {n} NaN(s) in exog '{col}' with last historical value {v}",
+                            n=int(nan_mask.sum()), col=col, v=fill_val,
+                        )
+                    # Align length
+                    if len(vals) < len(futr_df):
+                        vals = np.pad(vals, (0, len(futr_df) - len(vals)), mode="edge")
+                    elif len(vals) > len(futr_df):
+                        vals = vals[: len(futr_df)]
+                    futr_df[col] = vals
+                else:
+                    # Column missing from X_test entirely — use last historical value
+                    fill_val = hist_last_values.get(col, 0.0)
+                    futr_df[col] = fill_val
+                    self._logger.warning(
+                        "Exog column '{col}' missing from X_test; filled with historical last={v}",
+                        col=col, v=fill_val,
+                    )
 
         return futr_df
 
     def _predict_with_futr_df(self, futr_df: pd.DataFrame, hist_df: pd.DataFrame | None = None) -> pd.DataFrame:
         kwargs = {}
-        if futr_df is not None:
+        # Only pass futr_df if the model actually expects future exogenous features.
+        # When only hist_exog_list is configured, passing exog columns in futr_df
+        # causes NeuralForecast to raise or silently misinterpret them.
+        if futr_df is not None and self._has_futr_exog():
             kwargs["futr_df"] = futr_df
         if hist_df is not None:
             kwargs["df"] = hist_df
@@ -322,14 +419,28 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         self,
         forecast_df: pd.DataFrame,
         futr_df: pd.DataFrame,
+        n_expected: int | None = None,
     ) -> pd.DataFrame:
+        """Align forecast output to future dates.
+
+        Uses date-based merge first. If that produces NaN (date mismatch),
+        falls back to positional alignment to avoid injecting zeros into
+        the prediction output.
+        """
         if "ds" not in forecast_df.columns:
+            # No dates to align — return as-is, trimmed to n_expected
+            if n_expected is not None and len(forecast_df) > n_expected:
+                return forecast_df.iloc[:n_expected].copy()
             return forecast_df
 
         df = forecast_df.copy()
-        df["ds"] = pd.to_datetime(df["ds"])
+        df["ds"] = pd.to_datetime(df["ds"]).dt.normalize()
         base = futr_df.copy()
-        base["ds"] = pd.to_datetime(base["ds"])
+        base["ds"] = pd.to_datetime(base["ds"]).dt.normalize()
+
+        # Trim base to n_expected if model outputs fewer rows than futr_df
+        if n_expected is not None and n_expected < len(base):
+            base = base.iloc[:n_expected].copy()
 
         merge_cols = ["ds"]
         if "unique_id" in df.columns and "unique_id" in base.columns:
@@ -339,11 +450,19 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         aligned = base[merge_cols].merge(df, on=merge_cols, how="left")
 
         pred_cols = [col for col in aligned.columns if col not in {"unique_id", "ds"}]
-        if pred_cols and aligned[pred_cols].isna().any().any():
-            aligned[pred_cols] = aligned[pred_cols].ffill().bfill()
-            if aligned[pred_cols].isna().any().any():
-                aligned[pred_cols] = aligned[pred_cols].fillna(0.0)
-                self._logger.warning("Filled remaining NaNs in forecast output with 0.0")
+
+        # Check if date-based merge produced NaN (date mismatch)
+        has_nans = pred_cols and aligned[pred_cols].isna().any().any()
+        if has_nans:
+            self._logger.warning(
+                "Date-based alignment produced NaN; falling back to positional alignment"
+            )
+            # Positional fallback: take the first n_expected rows from forecast
+            n_use = min(len(df), len(base))
+            aligned = base.iloc[:n_use].copy()
+            for col in pred_cols:
+                if col in df.columns:
+                    aligned[col] = df[col].values[:n_use]
 
         return aligned
 

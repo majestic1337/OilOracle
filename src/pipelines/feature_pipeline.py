@@ -268,6 +268,13 @@ def save_lag_config(
     logger.info("Saved lag config to {path}", path=cfg_path)
     return payload
 
+def _fill_calendar_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure no missing business days in the index."""
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    
+    # Ресемплінг до бізнес-днів ('B') та заповнення пропусків останнім значенням
+    return df.asfreq("B").ffill()
 
 def run_feature_pipeline(
     processed_dir: str | Path = "data/processed",
@@ -287,6 +294,10 @@ def run_feature_pipeline(
 
     full_returns = pd.concat([train_returns, val_returns, test_returns]).sort_index()
     full_prices = pd.concat([train_prices, val_prices, test_prices]).sort_index()
+
+    # Виправлення пропусків у календарі (важливо для DL моделей)
+    full_returns = _fill_calendar_gaps(full_returns)
+    full_prices = _fill_calendar_gaps(full_prices)
 
     common_index = full_returns.index.intersection(full_prices.index)
     if common_index.empty:
