@@ -54,4 +54,9 @@ class PatchTSTForecaster(DeepLearningForecasterWrapper):
     def set_params(self, **params: Any) -> "PatchTSTForecaster":
         for key, value in params.items():
             setattr(self, key, value)
+        # Sync model_kwargs so _build_model uses updated values on next fit
+        if hasattr(self, "model_kwargs"):
+            for key in ("max_steps", "learning_rate"):
+                if key in params:
+                    self.model_kwargs[key] = params[key]
         return self

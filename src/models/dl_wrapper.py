@@ -106,7 +106,7 @@ class DeepLearningForecasterWrapper(BaseForecaster):
                     setattr(self, key, value)
         return self
 
-    def _prepare_df(self, X: pd.DataFrame, y: pd.Series = None) -> pd.DataFrame:
+    def _prepare_df(self, X: pd.DataFrame, y: Any | None = None) -> pd.DataFrame:
         df = pd.DataFrame(
             {
                 "unique_id": "brent",
@@ -114,7 +114,7 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             }
         )
         if y is not None:
-            df["y"] = y.values
+            df["y"] = np.asarray(y, dtype=float)
 
         # PatchTST не підтримує exogenous variables
         if self._supports_exogenous():
@@ -128,30 +128,30 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         return model_name not in {"PatchTST"}
 
     def _build_model(self, exog_columns: list[str]) -> Any:
-            model_kwargs = dict(self.model_kwargs)
+        model_kwargs = dict(self.model_kwargs)
 
-            if "h" not in model_kwargs:
-                model_kwargs["h"] = self.horizon
-            if "input_size" not in model_kwargs:
-                model_kwargs["input_size"] = self.input_size
+        if "h" not in model_kwargs:
+            model_kwargs["h"] = self.horizon
+        if "input_size" not in model_kwargs:
+            model_kwargs["input_size"] = self.input_size
 
-            if "accelerator" not in model_kwargs:
-                model_kwargs["accelerator"] = self._accelerator
+        if "accelerator" not in model_kwargs:
+            model_kwargs["accelerator"] = self._accelerator
                 
-            if model_kwargs.get("accelerator") == "cpu" and "devices" not in model_kwargs:
-                model_kwargs["devices"] = 1
+        if model_kwargs.get("accelerator") == "cpu" and "devices" not in model_kwargs:
+            model_kwargs["devices"] = 1
 
-            signature = inspect.signature(self.model_class)
-            if self._supports_exogenous():
+        signature = inspect.signature(self.model_class)
+        if self._supports_exogenous():
                 # Prevent leakage: never pass financial features as future exogenous inputs.
-                if "futr_exog_list" in model_kwargs:
-                    model_kwargs.pop("futr_exog_list", None)
-                    self._logger.warning(
+            if "futr_exog_list" in model_kwargs:
+                model_kwargs.pop("futr_exog_list", None)
+                self._logger.warning(
                         "Ignoring futr_exog_list in model kwargs to prevent leakage; "
                         "using hist_exog_list only."
                     )
 
-                if (
+            if (
                     "hist_exog_list" in signature.parameters
                     and exog_columns
                     and "hist_exog_list" not in model_kwargs
@@ -269,6 +269,15 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         is used as the authoritative source for both the last date and exog
         fallback values, overriding ``_last_train_df`` which may lag behind
         the current fold's window.
+
+        Note:
+            Dates are generated via pd.bdate_range (ISO business days). This may
+            include holidays absent from the Brent trading calendar defined in
+            align_series (data_pipeline.py). When X_test.index matches expected_dates
+            exactly, the X_test index is used directly (preferred path). If not,
+            generated ISO dates are used and _align_forecast_to_future may fall back
+            to positional alignment with a warning. To resolve fully, unify the
+            trading calendar across data_pipeline.py and dl_wrapper.py.
         """
         if X_test.empty:
             raise ValueError("X_test is empty")
@@ -523,6 +532,11 @@ class DeepLearningForecasterWrapper(BaseForecaster):
                 x_len=len(X),
             )
             if len(result) == 0:
+                self._logger.error(
+                    "NeuralForecast returned empty predictions for {model}; "
+                    "filling with zeros — check model fit and input data",
+                    model=self.model_class.__name__ if self.model_class else "unknown",
+                )
                 result = np.zeros(len(X), dtype=float)
             elif len(result) > len(X):
                 result = result[: len(X)]
