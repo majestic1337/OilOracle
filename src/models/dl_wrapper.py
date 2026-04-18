@@ -128,30 +128,30 @@ class DeepLearningForecasterWrapper(BaseForecaster):
         return model_name not in {"PatchTST"}
 
     def _build_model(self, exog_columns: list[str]) -> Any:
-        model_kwargs = dict(self.model_kwargs)
+            model_kwargs = dict(self.model_kwargs)
 
-        if "h" not in model_kwargs:
-            model_kwargs["h"] = self.horizon
-        if "input_size" not in model_kwargs:
-            model_kwargs["input_size"] = self.input_size
+            if "h" not in model_kwargs:
+                model_kwargs["h"] = self.horizon
+            if "input_size" not in model_kwargs:
+                model_kwargs["input_size"] = self.input_size
 
-        if "accelerator" not in model_kwargs:
-            model_kwargs["accelerator"] = self._accelerator
+            if "accelerator" not in model_kwargs:
+                model_kwargs["accelerator"] = self._accelerator
                 
-        if model_kwargs.get("accelerator") == "cpu" and "devices" not in model_kwargs:
-            model_kwargs["devices"] = 1
+            if model_kwargs.get("accelerator") == "cpu" and "devices" not in model_kwargs:
+                model_kwargs["devices"] = 1
 
-        signature = inspect.signature(self.model_class)
-        if self._supports_exogenous():
+            signature = inspect.signature(self.model_class)
+            if self._supports_exogenous():
                 # Prevent leakage: never pass financial features as future exogenous inputs.
-            if "futr_exog_list" in model_kwargs:
-                model_kwargs.pop("futr_exog_list", None)
-                self._logger.warning(
+                if "futr_exog_list" in model_kwargs:
+                    model_kwargs.pop("futr_exog_list", None)
+                    self._logger.warning(
                         "Ignoring futr_exog_list in model kwargs to prevent leakage; "
                         "using hist_exog_list only."
                     )
 
-            if (
+                if (
                     "hist_exog_list" in signature.parameters
                     and exog_columns
                     and "hist_exog_list" not in model_kwargs
