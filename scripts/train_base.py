@@ -15,7 +15,7 @@ from src.pipelines.wfv_orchestrator import WFVConfig
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "processed"
 DEFAULT_CONFIG_CANDIDATES: tuple[Path, ...] = (
-    PROJECT_ROOT / "configs" / "wfv_config.json",
+    PROJECT_ROOT / "configs" / "wfv_regression.json",
     PROJECT_ROOT / "configs" / "config.yaml",
 )
 WFV_FIELD_NAMES = {field.name for field in fields(WFVConfig)}
@@ -35,6 +35,16 @@ def resolve_data_dir(data_dir: str | Path) -> Path:
     if not resolved.exists():
         raise FileNotFoundError(f"Data directory not found: {resolved}")
     return resolved
+
+
+def resolve_config_path(config_arg: str | None) -> str | None:
+    """Resolve config path; return None if not found, logging a warning."""
+    if config_arg is None:
+        return None
+    if Path(config_arg).exists() or (PROJECT_ROOT / config_arg).exists():
+        return config_arg
+    logger.warning("Config file {path} not found; using defaults", path=config_arg)
+    return None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -140,18 +150,29 @@ def build_wfv_config(
         for key, value in _extract_wfv_config(config_payload).items()
         if key in WFV_FIELD_NAMES
     }
+    if "horizon" in params and params["horizon"] != horizon:
+        logger.info(
+            "CLI horizon={cli} overrides config horizon={cfg}",
+            cli=horizon,
+            cfg=params["horizon"],
+        )
     params["horizon"] = horizon
     params["model_family"] = model_family
     return WFVConfig(**params)
 
 
-def load_ml_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Series | pd.DataFrame]:
+def load_ml_data(
+    data_dir: Path,
+    horizon: int,
+    split_name: str,
+    max_lag: int,
+) -> tuple[pd.DataFrame, pd.Series | pd.DataFrame]:
     """Load ML feature matrix and shifted target."""
-    feature_path = data_dir / "feature_matrix_ml.parquet"
+    feature_path = data_dir / f"{split_name}_feature_matrix_ml_lag{max_lag}.parquet"
     if not feature_path.exists():
         raise FileNotFoundError(f"ML feature matrix not found: {feature_path}")
 
-    target_path = data_dir / f"target_h{horizon}.parquet"
+    target_path = data_dir / f"{split_name}_target_h{horizon}.parquet"
     if not target_path.exists():
         raise FileNotFoundError(f"Target file not found: {target_path}")
 
@@ -163,13 +184,17 @@ def load_ml_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Series 
     return X.loc[common_index].sort_index(), y_obj.loc[common_index].sort_index()
 
 
-def load_stat_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Series]:
+def load_stat_data(
+    data_dir: Path,
+    horizon: int,
+    split_name: str,
+) -> tuple[pd.DataFrame, pd.Series]:
     """Load stat-model features with properly shifted target matching ML semantics."""
-    dl_path = data_dir / "feature_matrix_dl.parquet"
+    dl_path = data_dir / f"{split_name}_feature_matrix_dl.parquet"
     if not dl_path.exists():
         raise FileNotFoundError(f"DL feature matrix (used for stat baselines) not found: {dl_path}")
 
-    target_path = data_dir / f"target_h{horizon}.parquet"
+    target_path = data_dir / f"{split_name}_target_h{horizon}.parquet"
     if not target_path.exists():
         raise FileNotFoundError(f"Target file not found: {target_path}")
 
@@ -191,22 +216,36 @@ def load_stat_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Serie
     return X_full.loc[common_index].sort_index(), y_obj.loc[common_index].sort_index()
 
 
-def load_dl_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Series]:
+def load_dl_data(
+    data_dir: Path,
+    horizon: int,
+    split_name: str,
+    max_lag: int,
+) -> tuple[pd.DataFrame, pd.Series]:
     """Load DL data in log-return space aligned with ML semantics.
 
     Uses:
-    - `feature_matrix_ml.parquet` as exogenous predictors
-    - `target_h{horizon}.parquet` as shifted target in return space
+    - `{split_name}_feature_matrix_ml_lag{max_lag}.parquet` as exogenous predictors
+    - `{split_name}_target_h{horizon}.parquet` as shifted target in return space
 
     Returned X contains NeuralForecast-compatible metadata columns
     (`unique_id`, `ds`) plus exogenous predictors. Target y is the shifted
     return series named `y`.
+
+    Note:
+        This loader intentionally uses the ML feature matrix (lags, rolling stats)
+        as exogenous regressors for NeuralForecast models. The DL-specific file
+        (feature_matrix_dl.parquet) uses raw price-space exogenous variables and
+        is loaded via load_stat_data. This cross-usage is deliberate: NeuralForecast
+        models in this project receive lag/rolling features as covariates, not raw prices.
+        If this design changes, update both this function and prepare_dl_data in
+        feature_engineering.py.
     """
-    feature_path = data_dir / "feature_matrix_ml.parquet"
+    feature_path = data_dir / f"{split_name}_feature_matrix_ml_lag{max_lag}.parquet"
     if not feature_path.exists():
         raise FileNotFoundError(f"ML feature matrix not found for DL training: {feature_path}")
 
-    target_path = data_dir / f"target_h{horizon}.parquet"
+    target_path = data_dir / f"{split_name}_target_h{horizon}.parquet"
     if not target_path.exists():
         raise FileNotFoundError(f"Target file not found: {target_path}")
 
@@ -227,6 +266,8 @@ def load_dl_data(data_dir: Path, horizon: int) -> tuple[pd.DataFrame, pd.Series]
 
 def load_dl_unshifted_data(
     data_dir: Path,
+    split_name: str,
+    max_lag: int,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Load DL data with **unshifted** target for MIMO architectures.
 
@@ -239,7 +280,7 @@ def load_dl_unshifted_data(
         (X, y_raw) where ``y_raw`` is the raw ``brent_return`` column from
         the ML feature matrix, aligned to the same index as X.
     """
-    feature_path = data_dir / "feature_matrix_ml.parquet"
+    feature_path = data_dir / f"{split_name}_feature_matrix_ml_lag{max_lag}.parquet"
     if not feature_path.exists():
         raise FileNotFoundError(f"ML feature matrix not found for DL training: {feature_path}")
 
@@ -247,7 +288,7 @@ def load_dl_unshifted_data(
 
     if "brent_return" not in X_ml.columns:
         raise ValueError(
-            "feature_matrix_ml.parquet must contain 'brent_return' column "
+            f"{feature_path.name} must contain 'brent_return' column "
             "for unshifted DL target"
         )
 
