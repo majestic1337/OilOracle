@@ -1,0 +1,10 @@
+{
+  "wfv": {
+    "task_type": "classification",
+    "w_train": 1000,
+    "w_val": 200,
+    "w_step": 20,
+    "window_type": "expanding",
+    "max_consecutive_failures": 3
+  }
+}

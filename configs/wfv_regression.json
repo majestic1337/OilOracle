@@ -1,27 +1,28 @@
 {
   "wfv": {
+    "task_type": "regression",
     "w_train": 1000,
     "w_val": 200,
     "w_step": 20,
-    "window_type": "rolling",
+    "window_type": "expanding",
     "max_consecutive_failures": 3
   },
   "models": {
     "tft": {
-      "input_size": 30,
-      "max_steps": 10,
-      "learning_rate": 0.01,
+      "input_size": 90,
+      "max_steps": 200,
+      "learning_rate": 0.001,
       "scaler_type": "standard",
       "local_scaler_type": null
     },
     "patchtst": {
-      "input_size": 30,
-      "max_steps": 10,
+      "input_size": 90,
+      "max_steps": 200,
       "learning_rate": 0.001
     },
     "nbeats": {
-      "input_size": 30,
-      "max_steps": 10,
+      "input_size": 90,
+      "max_steps": 200,
       "learning_rate": 0.001
     }
   }

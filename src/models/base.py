@@ -90,7 +90,7 @@ def as_2d_array(values: Any) -> np.ndarray:
 _to_numpy = as_1d_array
 
 
-def calculate_window_mase(
+def calculate_mase(
     y_train: Any,
     y_test: Any,
     y_pred: Any,
@@ -144,6 +144,9 @@ def calculate_window_mase(
     forecast_mae = float(np.mean(np.abs(test - pred)))
     return forecast_mae / naive_mae
 
+
+calculate_window_mase = calculate_mase  # backward-compat alias
+
 def calculate_metrics(y_train: Any, y_test: Any, y_pred: Any) -> dict[str, float]:
     """Compute Experiment A metrics (MASE, RMSE, MAE).
 
@@ -167,7 +170,7 @@ def calculate_metrics(y_train: Any, y_test: Any, y_pred: Any) -> dict[str, float
 
     rmse = float(np.sqrt(np.mean((test - pred) ** 2)))
     mae = float(np.mean(np.abs(test - pred)))
-    mase = float(calculate_window_mase(train, test, pred, m=1))
+    mase = float(calculate_mase(train, test, pred, m=1))
 
     return {"mase": mase, "rmse": rmse, "mae": mae}
 
@@ -182,6 +185,11 @@ def diebold_mariano_test(
     We compare loss differentials using a Newey-West style HAC variance that
     accounts for multi-step forecast overlap (lag = h-1). The loss function is
     squared error to stay consistent with the WFV regression setting.
+
+    Note:
+        HAC variance uses Bartlett kernel weights (w_j = 1 - j/h) following
+        Harvey, Leybourne & Newbold (1997). This differs from a flat-weight
+        Newey-West estimator.
 
     Args:
         errors_model: Forecast errors of the model under test (y - y_hat).
@@ -212,8 +220,9 @@ def diebold_mariano_test(
     hac_var = gamma0
 
     for lag in range(1, h):
+        weight = 1.0 - lag / h  # Bartlett kernel
         cov = float(np.mean(d_centered[lag:] * d_centered[:-lag]))
-        hac_var += 2.0 * cov
+        hac_var += 2.0 * weight * cov
 
     hac_var /= len(d)
 

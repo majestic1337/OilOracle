@@ -21,9 +21,10 @@ __all__ = [
 
 
 class XGBoostForecaster(BaseForecaster):
-    def __init__(self, random_state: int = 42, alpha: float = 0.1) -> None:
+    def __init__(self, random_state: int = 42, alpha: float = 0.1, task_type: str = "regression") -> None:
         self.random_state = random_state
         self.alpha = alpha
+        self.task_type = task_type
         self._logger = logger.bind(model=self.__class__.__name__)
         self.model_lower: Any | None = None
         self.model_q50: Any | None = None
@@ -32,9 +33,24 @@ class XGBoostForecaster(BaseForecaster):
 
     def _build_model(self, quantile: float) -> Any:
         try:
-            from xgboost import XGBRegressor
+            from xgboost import XGBRegressor, XGBClassifier
         except ImportError as exc:
             raise ImportError("xgboost is required") from exc
+
+        if self.task_type == "classification":
+            return XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                n_estimators=200,         
+                learning_rate=0.05,       
+                max_depth=2,              
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.5,            
+                reg_lambda=1.0,           
+                early_stopping_rounds=20,
+                random_state=self.random_state,
+            )
 
         # Use quantile objective for all quantiles, including q50 (median).
         objective = "reg:quantileerror"
@@ -66,22 +82,29 @@ class XGBoostForecaster(BaseForecaster):
 
         if X_val is None or y_val is None:
             # H8: Use last 10% as temporal validation (not random split)
-            split_idx = int(len(X_arr) * 0.9)
-            if split_idx < 1 or split_idx >= len(X_arr):
+            split_idx = int(len(X_arr) * 0.9) # type: ignore
+            if split_idx < 1 or split_idx >= len(X_arr): # type: ignore
                 self._logger.warning(
                     "Dataset too small for internal temporal split; using full set"
                 )
                 X_t, y_t = X_arr, y_arr
-                X_v, y_v = X_arr[-1:], y_arr[-1:]
+                X_v, y_v = X_arr[-1:], y_arr[-1:] # type: ignore
             else:
                 self._logger.info(
                     "No validation data provided; using last 10%% as temporal hold-out"
                 )
-                X_t, y_t = X_arr[:split_idx], y_arr[:split_idx]
-                X_v, y_v = X_arr[split_idx:], y_arr[split_idx:]
+                X_t, y_t = X_arr[:split_idx], y_arr[:split_idx] # type: ignore
+                X_v, y_v = X_arr[split_idx:], y_arr[split_idx:] # type: ignore
         else:
             X_t, y_t = X_arr, y_arr
             X_v, y_v = as_2d_array(X_val), as_1d_array(y_val)
+
+        eval_set = [(X_v, y_v)]
+
+        if self.task_type == "classification":
+            self.model_q50 = self._build_model(0.5)
+            self.model_q50.fit(X_t, y_t, eval_set=eval_set, verbose=False)
+            return self
 
         lower_q = self.alpha / 2.0
         upper_q = 1.0 - self.alpha / 2.0
@@ -89,8 +112,6 @@ class XGBoostForecaster(BaseForecaster):
         self.model_lower = self._build_model(lower_q)
         self.model_q50 = self._build_model(0.5)
         self.model_upper = self._build_model(upper_q)
-
-        eval_set = [(X_v, y_v)]
         
         self.model_lower.fit(X_t, y_t, eval_set=eval_set, verbose=False)
         self.model_q50.fit(X_t, y_t, eval_set=eval_set, verbose=False)
@@ -106,9 +127,13 @@ class XGBoostForecaster(BaseForecaster):
         if not isinstance(X_input, pd.DataFrame) and self.feature_names_:
             X_input = pd.DataFrame(X_input, columns=self.feature_names_)
             
+        if self.task_type == "classification":
+            return self.model_q50.predict_proba(as_2d_array(X_input))[:, 1].astype(float)
         return self.model_q50.predict(as_2d_array(X_input)).astype(float)
 
-    def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
+    def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if self.task_type == "classification":
+            return None, None
         if self.model_lower is None or self.model_upper is None:
             raise ValueError("XGBoostForecaster must be fitted before interval prediction")
             
@@ -118,20 +143,37 @@ class XGBoostForecaster(BaseForecaster):
         return lower, upper
 
 class LightGBMForecaster(BaseForecaster):
-    def __init__(self, random_state: int = 42, alpha: float = 0.1) -> None:
+    def __init__(self, random_state: int = 42, alpha: float = 0.1, task_type: str = "regression") -> None:
         self.random_state = random_state
         self.alpha = alpha
+        self.task_type = task_type
         self._logger = logger.bind(model=self.__class__.__name__)
         self.model_lower: Any | None = None
         self.model_q50: Any | None = None
         self.model_upper: Any | None = None
         self.feature_names_: list[str] | None = None
 
+    def _make_es_callbacks(self) -> list:
+        from lightgbm import early_stopping, log_evaluation
+        return [early_stopping(50), log_evaluation(0)]
+
     def _build_model(self, quantile: float) -> Any:
         try:
-            from lightgbm import LGBMRegressor
+            from lightgbm import LGBMRegressor, LGBMClassifier
         except ImportError as exc:
             raise ImportError("lightgbm is required") from exc
+
+        if self.task_type == "classification":
+            return LGBMClassifier(
+                objective="binary",
+                n_estimators=1000,
+                learning_rate=0.01,
+                num_leaves=31,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=self.random_state,
+                verbose=-1,
+            )
 
         # Use quantile objective for all quantiles, including q50 (median).
         objective = "quantile"
@@ -159,6 +201,18 @@ class LightGBMForecaster(BaseForecaster):
         X_arr = as_2d_array(X_train)
         y_arr = as_1d_array(y_train)
 
+        if self.task_type == "classification":
+            self.model_q50 = self._build_model(0.5)
+            if X_val is not None and y_val is not None:
+                X_v, y_v = as_2d_array(X_val), as_1d_array(y_val)
+                try:
+                    self.model_q50.fit(X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=self._make_es_callbacks())
+                except (ImportError, Exception):
+                    self.model_q50.fit(X_arr, y_arr)
+            else:
+                self.model_q50.fit(X_arr, y_arr)
+            return self
+
         lower_q = self.alpha / 2.0
         upper_q = 1.0 - self.alpha / 2.0
 
@@ -170,16 +224,14 @@ class LightGBMForecaster(BaseForecaster):
         if X_val is not None and y_val is not None:
             X_v, y_v = as_2d_array(X_val), as_1d_array(y_val)
             try:
-                from lightgbm import early_stopping, log_evaluation
-                es_callbacks = [early_stopping(50), log_evaluation(0)]
                 self.model_lower.fit(
-                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=es_callbacks
+                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=self._make_es_callbacks()
                 )
                 self.model_q50.fit(
-                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=es_callbacks
+                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=self._make_es_callbacks()
                 )
                 self.model_upper.fit(
-                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=es_callbacks
+                    X_arr, y_arr, eval_set=[(X_v, y_v)], callbacks=self._make_es_callbacks()
                 )
             except (ImportError, Exception):
                 self.model_lower.fit(X_arr, y_arr)
@@ -200,9 +252,13 @@ class LightGBMForecaster(BaseForecaster):
         if not isinstance(X_input, pd.DataFrame) and self.feature_names_:
             X_input = pd.DataFrame(X_input, columns=self.feature_names_)
         
+        if self.task_type == "classification":
+            return self.model_q50.predict_proba(X_input)[:, 1].astype(float)
         return self.model_q50.predict(X_input).astype(float)
 
-    def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
+    def predict_interval(self, X: Any, alpha: float = 0.1) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if self.task_type == "classification":
+            return None, None
         if self.model_lower is None or self.model_upper is None:
             raise ValueError("Interval models not fitted")
             

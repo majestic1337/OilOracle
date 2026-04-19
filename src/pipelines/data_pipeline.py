@@ -27,6 +27,8 @@ TABLE_MAP: dict[str, str] = {
     "gold": "gold_prices",
 }
 
+EWM_WARMUP_PERIODS = 3 * 26  # ~95% weight convergence for span=26
+
 
 def _read_price_table(engine: Engine, table_name: str, asset: str) -> pd.DataFrame:
     """Read a price table from PostgreSQL.
@@ -79,11 +81,12 @@ def load_raw_data(engine: Engine) -> pd.DataFrame:
     wide_df = pd.concat(frames, axis=1, join="outer", sort=True).sort_index()
     return wide_df
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators(df: pd.DataFrame, warmup_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """Compute technical indicators (RSI, MACD) for Brent.
     
     Args:
         df: Aligned DataFrame with price columns.
+        warmup_df: Optional DataFrame with previous observations for warm-up.
         
     Returns:
         Original DataFrame with appended indicator columns.
@@ -91,7 +94,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if "brent" not in df.columns:
         return df
 
-    out_df = df.copy()
+    if warmup_df is not None and not warmup_df.empty:
+        out_df = pd.concat([warmup_df, df]).copy()
+    else:
+        out_df = df.copy()
+
     brent = out_df["brent"]
 
     # RSI (14 days)
@@ -99,8 +106,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
     
-    avg_gain = gain.ewm(span=14, adjust=False).mean()
-    avg_loss = loss.ewm(span=14, adjust=False).mean()
+    avg_gain = gain.ewm(com=13, adjust=False).mean()
+    avg_loss = loss.ewm(com=13, adjust=False).mean()
     
     rs = avg_gain / avg_loss
     out_df["brent_rsi"] = 100.0 - (100.0 / (1.0 + rs))
@@ -113,6 +120,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     out_df["brent_macd"] = macd_line
     out_df["brent_signal"] = signal_line
+
+    if warmup_df is not None and not warmup_df.empty:
+        out_df = out_df.iloc[len(warmup_df):]
+        assert len(out_df) == len(df), f"Indicator slice mismatch: expected {len(df)}, got {len(out_df)}"
+        assert out_df.index.equals(df.index), "Indicator slice index mismatch"
 
     return out_df
 
@@ -134,7 +146,12 @@ def align_series(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df.index = pd.to_datetime(df.index)
 
-    weekdays_df = df[df.index.dayofweek < 5].sort_index()
+    weekend_mask = df.index.dayofweek >= 5
+    weekend_count = weekend_mask.sum()
+    if weekend_count > 0:
+        logger.warning("Dropped {n} weekend rows during alignment", n=weekend_count)
+
+    weekdays_df = df[~weekend_mask].sort_index()
     brent_index = weekdays_df["brent"].dropna().index
     if brent_index.empty:
         raise ValueError("Brent index is empty after dropping NaN values")
@@ -251,31 +268,24 @@ def _split_by_fixed_dates(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     val = df.loc["2022-01-01":"2023-12-31"].copy()
     test = df.loc["2024-01-01":"2026-03-10"].copy()
 
-    assert (
-        train.index.intersection(test.index).empty
-    ), "Train and test indices overlap; test must remain isolated."
+    if not train.index.intersection(test.index).empty:
+        raise ValueError("Train and test indices overlap; test must remain isolated.")
+    
     return {"train": train, "val": val, "test": test}
 
 
 def create_train_val_test_split(
-    aligned_df: pd.DataFrame,
-    returns_df: pd.DataFrame,
-) -> dict[str, dict[str, pd.DataFrame]]:
-    """Split aligned prices and returns into train/val/test partitions.
+    df: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Split aligned prices into train/val/test partitions.
 
     Args:
-        aligned_df: DataFrame of aligned raw prices.
-        returns_df: DataFrame of log returns.
+        df: DataFrame of aligned raw prices.
 
     Returns:
-        Nested dictionary with keys:
-        - "prices": {"train", "val", "test"} raw price splits
-        - "returns": {"train", "val", "test"} return splits
+        Dictionary with "train", "val", "test" splits.
     """
-    return {
-        "prices": _split_by_fixed_dates(aligned_df),
-        "returns": _split_by_fixed_dates(returns_df),
-    }
+    return _split_by_fixed_dates(df)
 
 
 def save_processed_data(
@@ -322,10 +332,23 @@ if __name__ == "__main__":
 
     raw_df = load_raw_data(engine)
     aligned_df = align_series(raw_df)
-    aligned_df = compute_indicators(aligned_df)
-    returns_df = compute_log_returns(aligned_df)
-    diagnostics = run_stationarity_diagnostics(returns_df)
-    split_sets = create_train_val_test_split(aligned_df=aligned_df, returns_df=returns_df)
+    
+    price_splits = create_train_val_test_split(aligned_df)
+    
+    train_prices = compute_indicators(price_splits["train"])
+    val_prices = compute_indicators(price_splits["val"], warmup_df=price_splits["train"].tail(EWM_WARMUP_PERIODS))
+    test_prices = compute_indicators(price_splits["test"], warmup_df=price_splits["val"].tail(EWM_WARMUP_PERIODS))
+    
+    train_returns = compute_log_returns(train_prices)
+    val_returns = compute_log_returns(val_prices)
+    test_returns = compute_log_returns(test_prices)
+    
+    split_sets = {
+        "prices": {"train": train_prices, "val": val_prices, "test": test_prices},
+        "returns": {"train": train_returns, "val": val_returns, "test": test_returns},
+    }
+    
+    diagnostics = run_stationarity_diagnostics(train_returns)
 
     save_processed_data(split_sets, diagnostics, output_dir=DEFAULT_PROCESSED_DIR)
 

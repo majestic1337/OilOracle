@@ -94,9 +94,14 @@ class TFTForecaster(DeepLearningForecasterWrapper):
             setattr(self, key, value)
 
         if hasattr(self, "model_kwargs"):
-            self.model_kwargs["max_steps"] = int(self.max_steps)
-            self.model_kwargs["learning_rate"] = float(self.learning_rate)
-            self.model_kwargs["scaler_type"] = self.scaler_type
+            for key in ("max_steps", "learning_rate", "scaler_type"):
+                if key in params:
+                    if key == "max_steps":
+                        self.model_kwargs[key] = int(params[key])
+                    elif key == "learning_rate":
+                        self.model_kwargs[key] = float(params[key])
+                    else:
+                        self.model_kwargs[key] = params[key]
         return self
 
     @staticmethod
@@ -182,7 +187,11 @@ class TFTForecaster(DeepLearningForecasterWrapper):
             None,
         )
         if q10_col is None or q90_col is None:
-            raise ValueError("Quantile outputs not found for TFT; ensure MQLoss quantiles are enabled")
+            raise ValueError(
+                f"Quantile columns not found in TFT output. "
+                f"Expected patterns: 'lo-80'/'hi-80' or 'q10'/'q90'. "
+                f"Available columns: {model_cols}"
+            )
 
         lower = forecast_df[q10_col].values[: len(X)]
         upper = forecast_df[q90_col].values[: len(X)]
