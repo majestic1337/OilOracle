@@ -296,7 +296,7 @@ def evaluate_experiment_a(
                 dm_result = diebold_mariano_test(model_errors, baseline_errors_model, h=horizon)
                 dm_stat = float(dm_result["dm_statistic"])
                 dm_p = float(dm_result["p_value"])
-                beats_rw = bool(dm_p < 0.05 and dm_stat < 0)
+                beats_rw = bool(dm_p < 0.05 and dm_stat > 0)
         else:
             dm_stat = float("nan")
             dm_p = float("nan")

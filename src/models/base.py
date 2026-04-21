@@ -175,30 +175,13 @@ def calculate_metrics(y_train: Any, y_test: Any, y_pred: Any) -> dict[str, float
     return {"mase": mase, "rmse": rmse, "mae": mae}
 
 
+# src/models/base.py
+
 def diebold_mariano_test(
     errors_model: Any,
     errors_benchmark: Any,
     h: int = 1,
 ) -> dict[str, float | str]:
-    """Diebold-Mariano test for predictive accuracy differences.
-
-    We compare loss differentials using a Newey-West style HAC variance that
-    accounts for multi-step forecast overlap (lag = h-1). The loss function is
-    squared error to stay consistent with the WFV regression setting.
-
-    Note:
-        HAC variance uses Bartlett kernel weights (w_j = 1 - j/h) following
-        Harvey, Leybourne & Newbold (1997). This differs from a flat-weight
-        Newey-West estimator.
-
-    Args:
-        errors_model: Forecast errors of the model under test (y - y_hat).
-        errors_benchmark: Forecast errors of the benchmark model.
-        h: Forecast horizon used in the experiment.
-
-    Returns:
-        Dictionary containing DM statistic, p-value, and better model label.
-    """
     if h < 1:
         raise ValueError("h must be >= 1")
 
@@ -208,11 +191,12 @@ def diebold_mariano_test(
     if len(err_model) != len(err_bench):
         raise ValueError("errors_model and errors_benchmark must have the same length")
 
-    if len(err_model) < 2:
+    n = len(err_model)
+    if n < 2:
         logger.warning("Not enough error observations for DM test")
         return {"dm_statistic": float("nan"), "p_value": float("nan"), "better_model": "tie"}
 
-    d = (err_model**2) - (err_bench**2)
+    d = np.abs(err_bench) - np.abs(err_model)
     mean_d = float(np.mean(d))
 
     d_centered = d - mean_d
@@ -220,30 +204,31 @@ def diebold_mariano_test(
     hac_var = gamma0
 
     for lag in range(1, h):
-        weight = 1.0 - lag / h  # Bartlett kernel
         cov = float(np.mean(d_centered[lag:] * d_centered[:-lag]))
-        hac_var += 2.0 * weight * cov
+        hac_var += 2.0 * cov
 
-    hac_var /= len(d)
+    hac_var /= n
 
     if hac_var <= 0:
         logger.warning("Non-positive HAC variance in DM test")
-        dm_stat = float("nan")
+        mdm_stat = float("nan")
         p_value = float("nan")
     else:
         dm_stat = mean_d / np.sqrt(hac_var)
+        hln_multiplier = np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
+        mdm_stat = dm_stat * hln_multiplier * np.sqrt(n)
+        
         try:
             from scipy.stats import t
-
-            p_value = float(2.0 * (1.0 - t.cdf(abs(dm_stat), df=len(d) - 1)))
-        except Exception:  # noqa: BLE001 - fallback to normal approximation
-            p_value = float(2.0 * (1.0 - 0.5 * (1.0 + erf(abs(dm_stat) / np.sqrt(2)))))
+            p_value = float(2.0 * (1.0 - t.cdf(abs(mdm_stat), df=n - 1)))
+        except Exception:
+            p_value = float(2.0 * (1.0 - 0.5 * (1.0 + erf(abs(mdm_stat) / np.sqrt(2)))))
 
     if np.isnan(mean_d) or abs(mean_d) < 1e-12:
         better = "tie"
-    elif mean_d < 0:
+    elif mean_d > 0:
         better = "model"
     else:
         better = "benchmark"
 
-    return {"dm_statistic": float(dm_stat), "p_value": float(p_value), "better_model": better}
+    return {"dm_statistic": float(mdm_stat), "p_value": float(p_value), "better_model": better}

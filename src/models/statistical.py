@@ -144,7 +144,7 @@ class ARIMAGARCHModel(BaseForecaster):
     strictly econometric. The model combines conditional mean (ARIMA) with
     conditional variance (GARCH) to emulate classic commodity return models.
     """
-    GARCH_SCALE: float = 10.0  # scale residuals before GARCH fit; divide std after
+    GARCH_SCALE: float = 100.0  # scale residuals before GARCH fit; divide std after
 
     def __init__(
         self,
