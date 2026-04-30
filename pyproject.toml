@@ -42,6 +42,8 @@ dependencies = [
     "ipywidgets>=8.1.8",
     "arch>=8.0.0",
     "pyautogui>=0.9.54",
+    "pytest>=9.0.3",
+    "google-genai>=1.68.0",
 ]
 
 [project.scripts]
@@ -53,6 +55,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
 
 [tool.ruff]
 line-length = 100

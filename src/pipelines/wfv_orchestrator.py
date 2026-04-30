@@ -418,7 +418,7 @@ def run_wfv(
     
     last_completed_fold = -1
     if model_name is not None and output_dir is not None:
-        cached = load_cached_results(model_name, config.horizon, output_dir)
+        cached = load_cached_results(model_name, config.horizon, output_dir,  model=model)
         if cached is not None:
             cached_iters, cached_preds = cached
             if cached_iters:
@@ -677,6 +677,7 @@ def run_wfv(
                     model_name,
                     output_dir,
                     fresh_start=fresh_start and is_first_save,
+                    model=fold_model if config.model_family == "dl" else None
                 )
 
             # Memory cleanup for DL models (PyTorch/Lightning graph accumulation)
@@ -716,7 +717,7 @@ def run_wfv(
     return iterations, predictions_df
 
 
-def load_cached_results(model_name: str, horizon: int, output_dir: str | Path) -> tuple[list[WFVIteration], pd.DataFrame] | None:
+def load_cached_results(model_name: str, horizon: int, output_dir: str | Path, model: Any | None = None) -> tuple[list[WFVIteration], pd.DataFrame] | None:
     output_path = Path(output_dir)
     predictions_path = output_path / f"predictions_{model_name}_{horizon}.parquet"
     audit_path = output_path / f"audit_{model_name}_{horizon}.json"
@@ -737,6 +738,23 @@ def load_cached_results(model_name: str, horizon: int, output_dir: str | Path) -
         predictions_df.index = pd.to_datetime(predictions_df.index)
 
     predictions_df = predictions_df.sort_index()
+    # Завантажуємо збережену модель якщо передана і підтримує load_model
+    if model is not None and hasattr(model, "load_model"):
+        model_save_path = output_path / f"model_{model_name}_{horizon}"
+        if model_save_path.exists():
+            try:
+                model.load_model(model_save_path)
+                logger.info(
+                    "Restored fitted model from {path}",
+                    path=model_save_path,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load model from {path}: {error}",
+                    path=model_save_path,
+                    error=str(exc),
+                )
+
     predictions_df.attrs["horizon"] = horizon
 
     try:
@@ -777,6 +795,7 @@ def save_wfv_results(
     model_name: str,
     output_dir: str | Path,
     fresh_start: bool = False,
+    model: Any | None = None
 ) -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -837,6 +856,13 @@ def save_wfv_results(
     audit_payload = existing_audit + audit_payload
     with audit_path.open("w", encoding="utf-8") as handle:
         json.dump(audit_payload, handle, indent=2)
+
+    if model is not None and hasattr(model, "save_model"):
+        model_save_path = output_path / f"model_{model_name}_{horizon_attr}"
+        try:
+            model.save_model(model_save_path)
+        except Exception as exc:
+            logger.warning("Failed to save model {name}: {error}", name=model_name, error=str(exc))
 
 
 if __name__ == "__main__":

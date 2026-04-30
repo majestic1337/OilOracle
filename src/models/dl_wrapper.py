@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -203,6 +204,33 @@ class DeepLearningForecasterWrapper(BaseForecaster):
             self._last_train_df = df_train
 
         return self
+
+    def save_model(self, path: str | Path) -> None:
+        """Зберігає fitted NeuralForecast модель на диск."""
+        if self._nf is None:
+            raise ValueError("Model must be fitted before saving")
+        save_path = Path(path)
+        save_path.mkdir(parents=True, exist_ok=True)
+        self._nf.save(str(save_path), overwrite=True)
+        logger.info("Saved NeuralForecast model to {path}", path=save_path)
+
+    def load_model(self, path: str | Path) -> None:
+        try:
+            from neuralforecast import NeuralForecast
+        except ImportError:
+            NeuralForecast = None
+        load_path = Path(path)
+        if not load_path.exists():
+            raise FileNotFoundError(f"Model path not found: {load_path}")
+        self._nf = NeuralForecast.load(str(load_path))
+        self.nf = self._nf
+        if self._nf.models:
+            self._model = self._nf.models[0]
+            self.model_instance = self._model
+            hist_exog = getattr(self._model, "hist_exog_list", None)
+            if hist_exog:
+                self._exog_columns = list(hist_exog)
+        logger.info("Loaded NeuralForecast model from {path}", path=load_path)
 
     def _has_futr_exog(self) -> bool:
         """Check if the underlying NeuralForecast model uses future exogenous features."""
