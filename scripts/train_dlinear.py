@@ -72,14 +72,19 @@ def run_training(
             end=X.index.max().date(),
         )
         iterations, predictions_df = run_wfv(
-            X=X, y=y, model=model, config=wfv_config, y_eval=y_eval,
+            X=X,
+            y=y,
+            model=model,
+            config=wfv_config,
+            model_name=model_name_resolved,
+            output_dir=resolved_data_dir,
         )
-        
         save_wfv_results(
             iterations=iterations,
             predictions=predictions_df,
             model_name=model_name_resolved,
             output_dir=resolved_data_dir,
+            model=model,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("DLinear training failed: {error}", error=str(exc))
